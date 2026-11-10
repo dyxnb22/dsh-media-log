@@ -110,11 +110,20 @@ dsh plugin --profile medialog-test add /绝对路径/dsh-media-log-<版本>.tgz
    deepseek-flash`，而 `DEEPSEEK_API_KEY` 通常不在凭据存储里——模型调用抛
    `MISSING_CREDENTIAL`，agent 永远到不了 idle，同样是静默挂住。把桌面 profile 里的
    `llm-pi-ai` + `agent-default-model` 两块抄进 profile 的 `cordis.patch.yml`。
-3. **CLI 不读凭据存储里的 `STEPFUN_API_KEY`**，要从子进程 env 传进去：
+3. **base bundle 把 `dsh-credentials-local` 默认设为 disabled**，所以 CLI profile 根本
+   不读 `~/.dsh/.credentials.yaml`，每个 `apiKeyEnv` provider 都报
+   `MISSING_CREDENTIAL`（桌面的 composition 里它是开着的）。在 profile 的
+   `cordis.patch.yml` 里打开——`disabled` 是**条目级**键，写进 `config:` 里不生效：
+
+```yaml
+- id: credentials
+  disabled: false
+```
+
+之后就能直接跑，不必把密钥搬进 env：
 
 ```bash
-STEPFUN_API_KEY=$(从 ~/.dsh/.credentials.yaml 取) \
-  dsh --profile medialog-test headless \
+dsh --profile medialog-test headless \
   --permission-mode danger-full-access \
   --json "用 media_log_search 搜「片名」，然后 media_log_get 读 revision"
 ```
