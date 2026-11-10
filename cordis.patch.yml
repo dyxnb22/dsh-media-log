@@ -1,0 +1,16 @@
+# dsh-media-log bundle layer — applied when a profile lists this bundle
+# (package.json declares `dsh.bundle.patch` pointing at this file).
+# `name` is a PACKAGE NAME resolved through the profile's node_modules —
+# the Host loads the package main export, which registers the three
+# media_log_* tools.
+- insert:
+    - id: media-log
+      name: dsh-media-log
+      config:
+        # Absolute path to the library file. Leave EMPTY to use the
+        # conventional location ~/.dsh/media-log/media.db (created on first
+        # use, owner-only). Only override this to put the library somewhere
+        # else on a LOCAL disk — never on iCloud/Dropbox/network storage.
+        databasePath: ''
+        # Writes (media_log_mark) stay OFF until you turn this on explicitly.
+        writeEnabled: false
