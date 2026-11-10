@@ -550,6 +550,77 @@ test('get: imported planned/paused/dropped records read back faithfully', async 
 })
 
 // ---------------------------------------------------------------------------
+// statement caching
+// ---------------------------------------------------------------------------
+
+/**
+ * Counts db.prepare() calls from this point on. node:sqlite exposes neither
+ * finalize() nor a statement count, so the observable property is "no new
+ * prepares happen for a library that is already open".
+ * @type {WeakMap<object, {n: number}>}
+ */
+const prepareTracker = new WeakMap()
+function trackPrepares(db) {
+  let entry = prepareTracker.get(db)
+  if (entry === undefined) {
+    entry = { n: 0 }
+    prepareTracker.set(db, entry)
+    const original = db.prepare.bind(db)
+    db.prepare = (...args) => {
+      entry.n += 1
+      return original(...args)
+    }
+  }
+  return entry
+}
+
+test('prepared statements are built once per library, not per call', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [{ id: UUID, title: '完美的日子', media_type: 'movie', status: 'completed' }])
+    let databasePath = s.dbPath
+    const holder = createLibraryHolder()
+    const [, search, get] = createTools(() => ({ databasePath, writeEnabled: true }), holder)
+
+    await search.execute({ query: '完美' }, exec())
+    const db = await holder(s.dbPath)
+    const tracker = trackPrepares(db)
+    for (let i = 0; i < 20; i += 1) {
+      await search.execute({ query: '完美' }, exec())
+      await get.execute({ assetId: UUID }, exec())
+    }
+    assert.equal(tracker.n, 0, '40 more tool calls must not re-prepare any statement')
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('a changed databasePath reopens and gets its own statement set', async () => {
+  const s = scratch()
+  try {
+    let databasePath = s.dbPath
+    const holder = createLibraryHolder()
+    const [, search] = createTools(() => ({ databasePath, writeEnabled: true }), holder)
+
+    await search.execute({ query: 'x' }, exec())
+    const first = await holder(s.dbPath)
+    const firstTracker = trackPrepares(first)
+
+    databasePath = join(s.dir, 'other.db')
+    await search.execute({ query: 'x' }, exec())
+    const second = await holder(databasePath)
+    assert.notEqual(second, first, 'a new path means a new handle')
+    const secondTracker = trackPrepares(second)
+    await search.execute({ query: 'x' }, exec())
+    assert.equal(secondTracker.n, 0, 'the new handle caches too')
+    assert.equal(firstTracker.n, 0, 'the closed handle is left alone')
+    second.close()
+  } finally {
+    s.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
 // render
 // ---------------------------------------------------------------------------
 
