@@ -3,19 +3,65 @@
 // constraints are enforced HERE before any database work. Only whitelisted
 // fields cross into the session.
 
+import { dateBound } from './dates.js'
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const MEDIA_TYPES = ['movie', 'tv', 'anime', 'game']
-/** What media_log_mark accepts. The schema keeps 5 so imported records with
- *  planned/paused/dropped still read back faithfully (proposal §4 note). */
-const MARK_STATUSES = ['in_progress', 'completed']
+/** All five stored statuses, accepted by both mark and list. */
+const MEDIA_STATUSES = ['planned', 'in_progress', 'completed', 'paused', 'dropped']
+/** media_log_list lifecycle filter. The default hides archived rows; 'all' is
+ *  the only way to see an archived and an active record in one page. */
+const LIFECYCLE_FILTERS = ['active', 'archived', 'all']
+const LIST_KEYS = [
+  'mediaType',
+  'status',
+  'lifecycle',
+  'completedFrom',
+  'completedBefore',
+  'limit',
+  'offset',
+]
+/** Omitted on create, status defaults to planned — "记一下《沙丘2》"
+ *  means "想看", and the model should not have to invent a state. */
+const DEFAULT_STATUS = 'planned'
 const NOTES_MAX = 2000
-const ROOT_KEYS = ['target', 'status', 'rating', 'progress', 'notes', 'replaceNotes']
+const ROOT_KEYS = [
+  'target',
+  'status',
+  'rating',
+  'progress',
+  'notes',
+  'replaceNotes',
+  'metadata',
+  'clear',
+  'lifecycle',
+]
+/** Correctable identity fields. Update only — create keeps taking them in target. */
+const METADATA_KEYS = ['title', 'mediaType', 'year']
+/** Emptyable fields. title and mediaType are NOT NULL, so they are absent here
+ *  by construction rather than by a runtime check. */
+const CLEARABLE = ['rating', 'year', 'notes', 'progress']
+/** media_log_mark lifecycle values. Deliberately narrower than the list's
+ *  LIFECYCLE_FILTERS: 'all' is a query window, not a state a record can hold. */
+const MARK_LIFECYCLES = ['active', 'archived']
+/** Every key target accepts, across all three modes. */
+const TARGET_KEYS = ['assetId', 'expectedRevision', 'title', 'mediaType', 'year']
+/** @returns {string | null} the trimmed title, or null when it is unusable */
+function usableTitle(value) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed.length >= 1 && trimmed.length <= 300 ? trimmed : null
+}
+/** @returns {boolean} */
+function usableYear(value) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1850 && value <= 2100
+}
 
 /**
  * @param {string} text
  * @returns {boolean} false when the text contains NUL.
  */
-export function hasNoNul(text) {
+function hasNoNul(text) {
   return !text.includes('\u0000')
 }
 
@@ -26,17 +72,20 @@ export function hasNoNul(text) {
  * @returns {{ok: true, value: NormalizedMark} | {ok: false, message: string}}
  *
  * @typedef {Object} NormalizedMark
- * @property {'update'|'create'} mode
+ * @property {'update'|'updateByTitle'|'create'} mode
  * @property {string} [assetId]
  * @property {number} [expectedRevision]
- * @property {string} [title]
- * @property {string} [mediaType]
- * @property {number} [year]
+ * @property {string} [title] the title to act on (create and updateByTitle)
+ * @property {string} [mediaType] create only: its presence is what marks a create
+ * @property {number} [year] create only
  * @property {string} [status]
  * @property {number} [rating]
  * @property {{current?: number, total?: number, unit?: string}} [progress]
  * @property {string} [notes]
  * @property {boolean} replaceNotes
+ * @property {{title?: string, mediaType?: string, year?: number}} [metadata] update only
+ * @property {Array<'rating'|'year'|'notes'|'progress'>} [clear] update only
+ * @property {'active'|'archived'} [lifecycle] update only
  */
 export function validateMarkArgs(args) {
   if (args === null || typeof args !== 'object' || Array.isArray(args)) {
@@ -51,20 +100,31 @@ export function validateMarkArgs(args) {
 
   const target = a.target
   if (target === null || typeof target !== 'object' || Array.isArray(target)) {
-    return { ok: false, message: '缺少 target：更新需 {assetId, expectedRevision}，新建需 {title, mediaType}。' }
+    return {
+      ok: false,
+      message:
+        '缺少 target：更新需 {assetId, expectedRevision}，按标题更新需 {title}，新建需 {title, mediaType}。',
+    }
   }
   const t = /** @type {Record<string, unknown>} */ (target)
-  const targetKeys = Object.keys(t)
-  const updateKeys = ['assetId', 'expectedRevision']
-  const createKeys = ['title', 'mediaType', 'year']
-  const hasUpdateKey = targetKeys.some((k) => updateKeys.includes(k))
-  const hasCreateKey = targetKeys.some((k) => createKeys.includes(k))
-  if (hasUpdateKey && hasCreateKey) {
-    return { ok: false, message: 'target 不能同时携带更新字段（assetId/expectedRevision）与新建字段（title/mediaType）。' }
-  }
-  for (const key of targetKeys) {
-    if (!updateKeys.includes(key) && !createKeys.includes(key)) {
+  for (const key of Object.keys(t)) {
+    if (!TARGET_KEYS.includes(key)) {
       return { ok: false, message: `target 含未知字段 ${key}。` }
+    }
+  }
+  const hasAssetId = t.assetId !== undefined
+  const hasTitle = t.title !== undefined
+  const hasMediaType = t.mediaType !== undefined
+  if (hasAssetId && (hasTitle || hasMediaType)) {
+    return {
+      ok: false,
+      message: 'target 不能同时带 assetId 和 title/mediaType：要么按 UUID 改，要么按标题改，要么新建。',
+    }
+  }
+  if (hasTitle && t.expectedRevision !== undefined) {
+    return {
+      ok: false,
+      message: '按标题更新不需要 expectedRevision——工具自己读当前 revision，读和写在同一个事务里。',
     }
   }
 
@@ -76,10 +136,18 @@ export function validateMarkArgs(args) {
 
   const status = a.status
   if (status !== undefined) {
-    if (typeof status !== 'string' || !MARK_STATUSES.includes(status)) {
-      return { ok: false, message: 'status 只接受 in_progress 或 completed。' }
+    if (typeof status !== 'string' || !MEDIA_STATUSES.includes(status)) {
+      return { ok: false, message: 'status 只接受 planned、in_progress、completed、paused、dropped。' }
     }
     value.status = status
+  }
+
+  const lifecycle = a.lifecycle
+  if (lifecycle !== undefined) {
+    if (typeof lifecycle !== 'string' || !MARK_LIFECYCLES.includes(lifecycle)) {
+      return { ok: false, message: 'lifecycle 只接受 active、archived。' }
+    }
+    value.lifecycle = /** @type {'active'|'archived'} */ (lifecycle)
   }
 
   const rating = a.rating
@@ -137,7 +205,94 @@ export function validateMarkArgs(args) {
     value.notes = trimmed
   }
 
-  if (hasUpdateKey) {
+
+  // metadata and clear only make sense against an existing row: a create has
+  // nothing to correct and nothing to empty. Both update paths accept them, so
+  // they are parsed before the mode is decided.
+  const metadata = a.metadata
+  if (metadata !== undefined) {
+    if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata)) {
+      return { ok: false, message: 'metadata 必须是对象。' }
+    }
+    const m = /** @type {Record<string, unknown>} */ (metadata)
+    for (const key of Object.keys(m)) {
+      if (!METADATA_KEYS.includes(key)) {
+        return { ok: false, message: `metadata 含未知字段 ${key}。` }
+      }
+    }
+    if (Object.keys(m).length === 0) {
+      return { ok: false, message: 'metadata 不能是空对象。' }
+    }
+    if (m.title !== undefined) {
+      if (typeof m.title !== 'string' || m.title.trim().length < 1 || m.title.trim().length > 300) {
+        return { ok: false, message: 'metadata.title 需要 1 到 300 个字符。' }
+      }
+      value.metadata = { ...value.metadata, title: m.title.trim() }
+    }
+    if (m.mediaType !== undefined) {
+      if (typeof m.mediaType !== 'string' || !MEDIA_TYPES.includes(m.mediaType)) {
+        return { ok: false, message: 'metadata.mediaType 只接受 movie、tv、anime、game。' }
+      }
+      value.metadata = { ...value.metadata, mediaType: m.mediaType }
+    }
+    if (m.year !== undefined) {
+      if (
+        typeof m.year !== 'number' ||
+        !Number.isInteger(m.year) ||
+        m.year < 1850 ||
+        m.year > 2100
+      ) {
+        return { ok: false, message: 'metadata.year 必须是 1850 到 2100 的整数。' }
+      }
+      value.metadata = { ...value.metadata, year: m.year }
+    }
+  }
+
+  const clear = a.clear
+  if (clear !== undefined) {
+    if (!Array.isArray(clear) || clear.length === 0) {
+      return { ok: false, message: 'clear 必须是非空数组。' }
+    }
+    /** @type {Array<'rating'|'year'|'notes'|'progress'>} */
+    const fields = []
+    for (const entry of clear) {
+      if (typeof entry !== 'string' || !CLEARABLE.includes(entry)) {
+        return {
+          ok: false,
+          message: `clear 只接受 ${CLEARABLE.join('、')}；标题和类型是必填项，不能清空。`,
+        }
+      }
+      if (!fields.includes(/** @type {any} */ (entry))) fields.push(/** @type {any} */ (entry))
+    }
+    value.clear = fields
+    // Setting and emptying the same field in one call is a contradiction, and
+    // a partial progress patch plus "empty the progress" is worse: it would
+    // leave the schema's unit-without-a-value CHECK to reject the write.
+    for (const [field, given] of [
+      ['rating', value.rating],
+      ['year', value.metadata?.year],
+      ['progress', value.progress],
+    ]) {
+      if (fields.includes(/** @type {any} */ (field)) && given !== undefined) {
+        return { ok: false, message: `clear 里有 ${field} 时不能再传 ${field} 的新值。` }
+      }
+    }
+    if (fields.includes('notes') && value.notes !== undefined) {
+      return { ok: false, message: 'clear 里有 notes 时不能再传新的 notes。' }
+    }
+  }
+
+  /** True when the call carries anything that can only patch an existing row. */
+  const hasPatch =
+    value.status !== undefined ||
+    value.rating !== undefined ||
+    value.progress !== undefined ||
+    value.notes !== undefined ||
+    value.metadata !== undefined ||
+    value.clear !== undefined ||
+    value.lifecycle !== undefined
+
+  if (hasAssetId) {
     if (typeof t.assetId !== 'string' || !UUID_RE.test(t.assetId)) {
       return { ok: false, message: 'target.assetId 必须是完整 UUID。' }
     }
@@ -151,44 +306,75 @@ export function validateMarkArgs(args) {
     value.mode = 'update'
     value.assetId = t.assetId
     value.expectedRevision = t.expectedRevision
-    if (
-      value.status === undefined &&
-      value.rating === undefined &&
-      value.progress === undefined &&
-      value.notes === undefined
-    ) {
-      return { ok: false, message: '更新至少要提供 status、rating、progress、notes 之一。' }
+    if (!hasPatch) {
+      return {
+        ok: false,
+        message: '更新至少要提供 status、rating、progress、notes、metadata、clear、lifecycle 之一。',
+      }
     }
-  } else {
-    if (typeof t.title !== 'string' || t.title.trim().length < 1 || t.title.trim().length > 300) {
+    return { ok: true, value: /** @type {NormalizedMark} */ (value) }
+
+  } else if (hasTitle && hasMediaType) {
+    const title = usableTitle(t.title)
+    if (title === null) {
       return { ok: false, message: 'target.title 需要 1 到 300 个字符。' }
     }
     if (typeof t.mediaType !== 'string' || !MEDIA_TYPES.includes(t.mediaType)) {
       return { ok: false, message: 'target.mediaType 只接受 movie、tv、anime、game。' }
     }
-    if (t.year !== undefined) {
-      if (
-        typeof t.year !== 'number' ||
-        !Number.isInteger(t.year) ||
-        t.year < 1850 ||
-        t.year > 2100
-      ) {
-        return { ok: false, message: 'target.year 必须是 1850 到 2100 的整数。' }
-      }
-      value.year = t.year
+    if (t.year !== undefined && !usableYear(t.year)) {
+      return { ok: false, message: 'target.year 必须是 1850 到 2100 的整数。' }
     }
     value.mode = 'create'
-    value.title = t.title.trim()
+    value.title = title
     value.mediaType = t.mediaType
-    // 新建要求 status。
-    if (value.status === undefined) {
-      return { ok: false, message: '新建需要 status（in_progress 或 completed）。' }
-    }
+    value.year = usableYear(t.year) ? /** @type {number} */ (t.year) : undefined
+    // "记一下《沙丘2》" carries no state, and the honest reading of that is
+    // "想看" — so the state is optional here rather than something the model
+    // has to make up.
+    value.status = value.status ?? DEFAULT_STATUS
     if (value.replaceNotes === true) {
       return { ok: false, message: 'replaceNotes 只用于更新已有条目。' }
     }
+    if (a.metadata !== undefined) {
+      return { ok: false, message: 'metadata 只用于更新已有条目；新建的身份字段写在 target 里。' }
+    }
+    if (a.clear !== undefined) {
+      return { ok: false, message: 'clear 只用于更新已有条目；新建的记录没有可清空的内容。' }
+    }
+    if (a.lifecycle !== undefined) {
+      return { ok: false, message: 'lifecycle 只用于更新已有条目；新建的记录永远是 active。' }
+    }
+    return { ok: true, value: /** @type {NormalizedMark} */ (value) }
+  } else if (hasTitle) {
+    // A title WITHOUT mediaType is an update by title: mediaType is the field
+    // that says "this work is new", so its absence is what separates
+    // "把《沙丘2》标成看完" from "记一下《繁花》，看完了".
+    if (!hasPatch) {
+      return {
+        ok: false,
+        message: '按标题更新需要至少一个要改的字段（status/rating/progress/notes/metadata/clear/lifecycle）；要新建请在 target 里补上 mediaType。',
+      }
+    }
+    const title = usableTitle(t.title)
+    if (title === null) {
+      return { ok: false, message: 'target.title 需要 1 到 300 个字符。' }
+    }
+    if (t.mediaType !== undefined || t.year !== undefined) {
+      return {
+        ok: false,
+        message: '按标题更新只接受 target {title}；类型和年份的纠正请用 metadata。',
+      }
+    }
+    value.mode = 'updateByTitle'
+    value.title = title
+    return { ok: true, value: /** @type {NormalizedMark} */ (value) }
+  } else {
+    return {
+      ok: false,
+      message: '缺少 target：更新需 {assetId, expectedRevision}，按标题更新需 {title}，新建需 {title, mediaType}。',
+    }
   }
-  return { ok: true, value: /** @type {NormalizedMark} */ (value) }
 }
 
 /**
@@ -267,6 +453,121 @@ export function mapCandidate(row) {
 }
 
 /**
+ * Validates the media_log_list arguments. Every filter is optional; an absent
+ * filter means "do not narrow", which is why `lifecycle` — the one filter whose
+ * absence must mean something specific — is defaulted rather than left null.
+ * @param {unknown} args
+ * @returns {{ok: true, value: NormalizedList} | {ok: false, message: string}}
+ *
+ * @typedef {Object} NormalizedList
+ * @property {string} [mediaType]
+ * @property {string} [status]
+ * @property {'active'|'archived'|'all'} lifecycle
+ * @property {string|null} completedFrom inclusive lower bound, canonical UTC
+ * @property {string|null} completedBefore exclusive upper bound, canonical UTC
+ * @property {number} limit
+ * @property {number} offset
+ */
+export function validateListArgs(args) {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+    return { ok: false, message: '参数必须是一个对象。' }
+  }
+  const a = /** @type {Record<string, unknown>} */ (args)
+  for (const key of Object.keys(a)) {
+    if (!LIST_KEYS.includes(key)) {
+      return { ok: false, message: `未知参数字段 ${key}。` }
+    }
+  }
+
+  /** @type {NormalizedList} */
+  const value = { lifecycle: 'active', completedFrom: null, completedBefore: null, limit: 10, offset: 0 }
+
+  if (a.mediaType !== undefined) {
+    if (typeof a.mediaType !== 'string' || !MEDIA_TYPES.includes(a.mediaType)) {
+      return { ok: false, message: 'mediaType 只接受 movie、tv、anime、game。' }
+    }
+    value.mediaType = a.mediaType
+  }
+  if (a.status !== undefined) {
+    if (typeof a.status !== 'string' || !MEDIA_STATUSES.includes(a.status)) {
+      return {
+        ok: false,
+        message: 'status 只接受 planned、in_progress、completed、paused、dropped。',
+      }
+    }
+    value.status = a.status
+  }
+  if (a.lifecycle !== undefined) {
+    if (typeof a.lifecycle !== 'string' || !LIFECYCLE_FILTERS.includes(a.lifecycle)) {
+      return { ok: false, message: 'lifecycle 只接受 active、archived、all。' }
+    }
+    value.lifecycle = /** @type {'active'|'archived'|'all'} */ (a.lifecycle)
+  }
+
+  const from = dateBound(a.completedFrom, 'completedFrom')
+  if (!from.ok) return { ok: false, message: from.message }
+  value.completedFrom = from.iso
+  const before = dateBound(a.completedBefore, 'completedBefore')
+  if (!before.ok) return { ok: false, message: before.message }
+  value.completedBefore = before.iso
+  // Both bounds are canonical UTC, so text order is chronological order here.
+  if (value.completedFrom !== null && value.completedBefore !== null) {
+    if (value.completedFrom >= value.completedBefore) {
+      return { ok: false, message: 'completedFrom 必须早于 completedBefore。' }
+    }
+  }
+
+  if (a.limit !== undefined) {
+    if (typeof a.limit !== 'number' || !Number.isInteger(a.limit) || a.limit < 1 || a.limit > 20) {
+      return { ok: false, message: 'limit 必须是 1 到 20 的整数。' }
+    }
+    value.limit = a.limit
+  }
+  if (a.offset !== undefined) {
+    if (typeof a.offset !== 'number' || !Number.isInteger(a.offset) || a.offset < 0 || a.offset > 1000) {
+      return { ok: false, message: 'offset 必须是 0 到 1000 的整数。' }
+    }
+    value.offset = a.offset
+  }
+  return { ok: true, value }
+}
+
+/**
+ * Whitelist-maps one stored row into a list item. Unlike mapCandidate this
+ * carries rating and progress, because a list is meant to be read as an answer
+ * rather than as a set of update handles.
+ * @param {Record<string, unknown>} row
+ */
+export function mapListItem(row) {
+  return {
+    assetId: typeof row.id === 'string' ? row.id : '',
+    title: typeof row.title === 'string' ? row.title : '',
+    mediaType: typeof row.media_type === 'string' ? row.media_type : '',
+    year: typeof row.year === 'number' ? row.year : null,
+    status: typeof row.status === 'string' ? row.status : null,
+    lifecycle: typeof row.lifecycle === 'string' ? row.lifecycle : '',
+    rating: typeof row.rating === 'number' ? row.rating : null,
+    progress: mapProgress(row),
+  }
+}
+
+/**
+ * Progress columns → a single object, or null when nothing is set. A unit label
+ * alone is impossible (the schema forbids it), so it never needs a case.
+ * @param {Record<string, unknown>} row
+ */
+function mapProgress(row) {
+  if (row.progress_current === null && row.progress_total === null && row.progress_unit === null) {
+    return null
+  }
+  return {
+    current: row.progress_current ?? null,
+    total: row.progress_total ?? null,
+    unit: row.progress_unit ?? null,
+  }
+}
+
+/**
  * Whitelist-maps the detail of one record, truncating notes when included.
  * @param {Record<string, unknown>} row
  * @param {boolean} includeNotes
@@ -282,16 +583,10 @@ export function mapDetail(row, includeNotes) {
     lifecycle: row.lifecycle ?? null,
     status: row.status ?? null,
     rating: row.rating ?? null,
-    progress:
-      row.progress_current === null && row.progress_total === null && row.progress_unit === null
-        ? null
-        : {
-            current: row.progress_current ?? null,
-            total: row.progress_total ?? null,
-            unit: row.progress_unit ?? null,
-          },
+    progress: mapProgress(row),
     startedAt: row.started_at ?? null,
     completedAt: row.completed_at ?? null,
+    archivedAt: row.archived_at ?? null,
     hasNotes: typeof row.notes === 'string' && row.notes.length > 0,
   }
   if (includeNotes) {

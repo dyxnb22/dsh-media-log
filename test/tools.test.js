@@ -6,8 +6,8 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createTools, createLibraryHolder } from '../src/tools.js'
-import { openLibrary, resolveDatabasePath } from '../src/db.js'
+import { createTools } from '../src/tools.js'
+import { openLibrary, resolveDatabasePath, inTransaction, createLibraryHolder } from '../src/db.js'
 
 const UUID = '11111111-2222-3333-4444-555555555555'
 
@@ -24,8 +24,8 @@ function scratch() {
 async function harness({ databasePath = '', writeEnabled = true } = {}) {
   const getLibrary = createLibraryHolder()
   const tools = createTools(() => ({ databasePath, writeEnabled }), getLibrary)
-  const [mark, search, get] = tools
-  return { mark, search, get, getLibrary }
+  const [mark, search, get, list] = tools
+  return { mark, search, get, list, getLibrary }
 }
 
 const exec = (signal) => ({ signal: signal ?? new AbortController().signal })
@@ -74,8 +74,58 @@ test('openLibrary creates the library owner-only and is idempotent', async () =>
     assert.equal(dirMode, 0o700, `expected 0o700, got ${dirMode.toString(8)}`)
     // A second open must not fail or lose the schema.
     const again = await openLibrary(s.dbPath)
-    assert.equal(again.prepare('PRAGMA user_version').get().user_version, 1)
+    assert.equal(again.prepare('PRAGMA user_version').get().user_version, 7)
+    assert.deepEqual(
+      again.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map((row) => row.name),
+      ['changes', 'media', 'software', 'subscriptions'],
+      'a fresh library creates only the four supported tables',
+    )
     again.close()
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('a v1 library gains the subscriptions table on its next open', async () => {
+  const s = scratch()
+  try {
+    // Build a library the way version 1 did: media only, user_version 1.
+    const { DatabaseSync } = await import('node:sqlite')
+    const db = new DatabaseSync(s.dbPath)
+    db.exec(`CREATE TABLE media (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, media_type TEXT NOT NULL,
+      year INTEGER, status TEXT NOT NULL, rating REAL,
+      progress_current REAL, progress_total REAL, progress_unit TEXT, notes TEXT,
+      lifecycle TEXT NOT NULL DEFAULT 'active', revision INTEGER NOT NULL DEFAULT 1,
+      started_at TEXT, completed_at TEXT, archived_at TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`)
+    db.exec(`INSERT INTO media (id, title, media_type, status, created_at, updated_at)
+             VALUES ('11111111-2222-3333-4444-555555555555', '老记录', 'movie', 'completed',
+                     '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z')`)
+    db.exec('PRAGMA user_version = 1')
+    db.close()
+
+    const upgraded = await openLibrary(s.dbPath)
+    try {
+      assert.equal(upgraded.prepare('PRAGMA user_version').get().user_version, 7)
+      // The new table is there, and the old rows survived untouched.
+      assert.equal(
+        upgraded.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name='subscriptions'").get().n,
+        1,
+      )
+      assert.equal(upgraded.prepare('SELECT count(*) AS n FROM media').get().n, 1)
+      assert.equal(upgraded.prepare('SELECT title FROM media').get().title, '老记录')
+      // Only new tables are needed; the existing media rows keep their shape.
+      for (const table of ['subscriptions', 'software', 'changes']) {
+        assert.equal(
+          upgraded.prepare(`SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name=?`).get(table).n,
+          1,
+          table,
+        )
+      }
+    } finally {
+      upgraded.close()
+    }
   } finally {
     s.cleanup()
   }
@@ -93,12 +143,46 @@ test('the conventional default path lives under the DSH home', () => {
 })
 
 test('a relative databasePath is rejected before anything is opened', async () => {
-  const { mark } = await harness({ databasePath: 'relative/media.db' })
-  const value = await mark.execute(
-    { target: { assetId: UUID, expectedRevision: 1 }, rating: 8 },
-    exec(),
+  const tools = createTools(
+    () => ({ databasePath: 'relative/media.db', writeEnabled: true }),
+    async () => assert.fail('an invalid config must not open a database'),
   )
-  assert.equal(value.error.code, 'CONFIG_REQUIRED')
+  const args = [
+    { target: { assetId: UUID, expectedRevision: 1 }, rating: 8 },
+    { query: '片名' },
+    { assetId: UUID },
+    { status: 'planned' },
+  ]
+  for (let i = 0; i < tools.length; i += 1) {
+    assert.equal((await tools[i].execute(args[i], exec())).error.code, 'CONFIG_REQUIRED')
+  }
+})
+
+test('inTransaction preserves SQLITE_FULL after SQLite automatically rolls back', async () => {
+  const s = scratch()
+  const db = await openLibrary(s.dbPath)
+  try {
+    const insert = db.prepare(
+      'INSERT INTO media (id, title, media_type, status, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    )
+    insert.run(UUID, '原有记录', 'movie', 'completed', '原有短评', '2026', '2026')
+    const before = db.prepare('SELECT * FROM media').all()
+    const pages = db.prepare('PRAGMA page_count').get().page_count
+    db.exec(`PRAGMA max_page_count = ${pages}`)
+    assert.throws(
+      () => inTransaction(db, () => {
+        for (let i = 0; i < 20; i += 1) {
+          insert.run(`filler-${i}`, `填充 ${i}`, 'movie', 'completed', 'x'.repeat(2000), '2026', '2026')
+        }
+      }),
+      (error) => error.errcode === 13,
+    )
+    assert.equal(db.isTransaction, false)
+    assert.deepEqual(db.prepare('SELECT * FROM media').all(), before)
+  } finally {
+    db.close()
+    s.cleanup()
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -191,6 +275,76 @@ test('create: started_at/completed_at follow the status', async () => {
   }
 })
 
+test('create: every stored status can be created, not just the two mark used to allow', async () => {
+  const s = scratch()
+  try {
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+    for (const [i, status] of ['planned', 'in_progress', 'completed', 'paused', 'dropped'].entries()) {
+      const value = await mark.execute(
+        { target: { title: `作品-${status}`, mediaType: 'movie', year: 2000 + i }, status },
+        exec(),
+      )
+      assert.equal(value.ok, true, status)
+      const detail = await get.execute({ assetId: value.data.receipt.assetId }, exec())
+      assert.equal(detail.data.status, status, status)
+      // Only the status that speaks to a date sets one; paused/dropped set neither.
+      assert.equal(detail.data.startedAt !== null, status === 'in_progress', `startedAt for ${status}`)
+      assert.equal(detail.data.completedAt !== null, status === 'completed', `completedAt for ${status}`)
+    }
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('create: no status means planned, with no dates invented', async () => {
+  const s = scratch()
+  try {
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+    const value = await mark.execute({ target: { title: '沙丘2', mediaType: 'movie' } }, exec())
+    assert.equal(value.ok, true)
+    assert.equal(value.data.receipt.outcome, 'created')
+    const detail = await get.execute({ assetId: value.data.receipt.assetId }, exec())
+    assert.equal(detail.data.status, 'planned')
+    assert.equal(detail.data.startedAt, null)
+    assert.equal(detail.data.completedAt, null)
+    const text = render(mark, { target: { title: '沙丘2', mediaType: 'movie' } }, value)
+    assert.match(text, /想看/)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: any status can be corrected directly, without routing through in_progress', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: UUID, title: '搁置中的一部', media_type: 'movie', status: 'planned', revision: 1 },
+    ])
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+    // planned -> dropped straight away: no in_progress stop on the way.
+    const dropped = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 1 }, status: 'dropped' }, exec(),
+    )
+    assert.equal(dropped.ok, true)
+    const detail = await get.execute({ assetId: UUID }, exec())
+    assert.equal(detail.data.status, 'dropped')
+    assert.equal(detail.data.startedAt, null, 'a status that says nothing about dates invents none')
+    assert.equal(detail.data.completedAt, null)
+
+    // Re-stating the same status is a no-op: no revision, no date churn.
+    const again = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 2 }, status: 'dropped' }, exec(),
+    )
+    assert.equal(again.data.receipt.outcome, 'unchanged', 're-stating the same status is a no-op')
+    assert.equal(again.data.receipt.revision, 2)
+    const still = await get.execute({ assetId: UUID }, exec())
+    assert.equal(still.data.revision, 2)
+    assert.equal(still.data.startedAt, null)
+  } finally {
+    s.cleanup()
+  }
+})
+
 test('create: a unique active same-title candidate stops the write', async () => {
   const s = scratch()
   try {
@@ -247,6 +401,29 @@ test('create: a partial title match does not block a new entry', async () => {
   }
 })
 
+test('create: an older exact title cannot hide behind ten newer partial matches', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: UUID, title: '完美', media_type: 'movie', status: 'completed', updated_at: '2020' },
+      ...Array.from({ length: 10 }, (_, i) => ({
+        id: `${i.toString(16).padStart(8, '0')}-2222-3333-4444-555555555555`,
+        title: `完美的续篇 ${i}`, media_type: 'movie', status: 'completed', updated_at: '2026',
+      })),
+    ])
+    const { mark, getLibrary } = await harness({ databasePath: s.dbPath })
+    const value = await mark.execute(
+      { target: { title: '完美', mediaType: 'movie' }, status: 'completed' }, exec(),
+    )
+    assert.equal(value.error?.code, 'TARGET_CONFLICT')
+    assert.equal(value.error.candidates[0].assetId, UUID)
+    const db = await getLibrary(s.dbPath)
+    assert.equal(db.prepare('SELECT count(*) n FROM media').get().n, 11)
+  } finally {
+    s.cleanup()
+  }
+})
+
 // ---------------------------------------------------------------------------
 // update
 // ---------------------------------------------------------------------------
@@ -267,6 +444,585 @@ test('update: patches under the observed revision and bumps it', async () => {
     assert.equal(back.data.status, 'completed')
     assert.equal(back.data.rating, 9)
     assert.equal(back.data.revision, 2)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: status transitions fill missing dates and preserve existing dates and no-ops', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [{ id: UUID, title: '计划中的一部', media_type: 'tv', status: 'planned' }])
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+    const started = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 1 }, status: 'in_progress' }, exec(),
+    )
+    assert.equal(started.ok, true)
+    assert.ok(Number.isFinite(Date.parse(started.data.media.startedAt)))
+    assert.equal(started.data.media.completedAt, null)
+    const completed = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 2 }, status: 'completed' }, exec(),
+    )
+    assert.equal(completed.ok, true)
+    assert.equal(completed.data.media.startedAt, started.data.media.startedAt)
+    assert.ok(Number.isFinite(Date.parse(completed.data.media.completedAt)))
+    for (const [expectedRevision, status] of [[3, 'in_progress'], [4, 'completed']]) {
+      const result = await mark.execute({ target: { assetId: UUID, expectedRevision }, status }, exec())
+      assert.equal(result.ok, true)
+      assert.equal(result.data.media.startedAt, started.data.media.startedAt)
+      assert.equal(result.data.media.completedAt, completed.data.media.completedAt)
+    }
+    const unchanged = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 5 }, status: 'completed' }, exec(),
+    )
+    assert.equal(unchanged.data.receipt.outcome, 'unchanged')
+    const back = await get.execute({ assetId: UUID }, exec())
+    assert.equal(back.data.revision, 5)
+    assert.equal(back.data.startedAt, started.data.media.startedAt)
+    assert.equal(back.data.completedAt, completed.data.media.completedAt)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: metadata corrects title, mediaType and year, and omits nothing else', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      {
+        id: UUID,
+        title: '沙丘2',
+        media_type: 'movie',
+        year: 2021,
+        status: 'completed',
+        rating: 8,
+        progress_current: 2,
+        progress_total: 3,
+        progress_unit: '小时',
+        notes: '原短评',
+        revision: 1,
+      },
+    ])
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+    const value = await mark.execute(
+      {
+        target: { assetId: UUID, expectedRevision: 1 },
+        metadata: { title: '沙丘：第二部', mediaType: 'tv', year: 2024 },
+      },
+      exec(),
+    )
+    assert.equal(value.ok, true)
+    const detail = await get.execute({ assetId: UUID }, exec())
+    assert.equal(detail.data.title, '沙丘：第二部')
+    assert.equal(detail.data.mediaType, 'tv')
+    assert.equal(detail.data.year, 2024)
+    // Everything not named in metadata survives untouched.
+    assert.equal(detail.data.status, 'completed')
+    assert.equal(detail.data.rating, 8)
+    assert.deepEqual(detail.data.progress, { current: 2, total: 3, unit: '小时' })
+    assert.equal(detail.data.hasNotes, true)
+
+    const again = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 2 }, metadata: { year: 2024 } }, exec(),
+    )
+    assert.equal(again.data.receipt.outcome, 'unchanged', 'the same correction is a no-op')
+    assert.equal(again.data.receipt.revision, 2)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: renaming onto another record\'s title is refused, archived ones included', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: UUID, title: '沙丘', media_type: 'movie', status: 'completed' },
+      { id: 'bbbbbbbb-2222-3333-4444-555555555555', title: '沙丘：第二部', media_type: 'movie', status: 'completed' },
+      { id: 'cccccccc-2222-3333-4444-555555555555', title: '旧版沙丘', media_type: 'movie', status: 'completed', lifecycle: 'archived' },
+    ])
+    const { mark } = await harness({ databasePath: s.dbPath })
+    const clash = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 1 }, metadata: { title: '沙丘：第二部' } }, exec(),
+    )
+    assert.equal(clash.error.code, 'TARGET_CONFLICT')
+    assert.equal(clash.error.candidates.length, 1)
+    assert.equal(clash.error.candidates[0].assetId, 'bbbbbbbb-2222-3333-4444-555555555555')
+
+    // An archived row with that title blocks it too, exactly as it blocks a create.
+    const archivedClash = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 1 }, metadata: { title: '旧版沙丘' } }, exec(),
+    )
+    assert.equal(archivedClash.error.code, 'TARGET_CONFLICT')
+    assert.equal(archivedClash.error.candidates[0].assetId, 'cccccccc-2222-3333-4444-555555555555')
+
+    // A free title is fine.
+    const free = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 1 }, metadata: { title: '沙丘：第一部' } }, exec(),
+    )
+    assert.equal(free.ok, true)
+    assert.equal(free.data.media.title, '沙丘：第一部')
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: clear empties rating, year, notes and progress', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      {
+        id: UUID,
+        title: '完美的日子',
+        media_type: 'movie',
+        year: 2023,
+        status: 'completed',
+        rating: 9,
+        progress_current: 3,
+        progress_total: 10,
+        progress_unit: '小时',
+        notes: '值得重看',
+        revision: 1,
+      },
+    ])
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+    const read = async () => (await get.execute({ assetId: UUID, includeNotes: true }, exec())).data
+
+    const cleared = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 1 }, clear: ['rating', 'year', 'progress'], replaceNotes: true },
+      exec(),
+    )
+    assert.equal(cleared.ok, true)
+    let d = await read()
+    assert.equal(d.rating, null)
+    assert.equal(d.year, null)
+    assert.equal(d.progress, null)
+    assert.equal(d.hasNotes, true, 'notes were not in clear')
+
+    const emptiedNotes = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 2 }, clear: ['notes'], replaceNotes: true }, exec(),
+    )
+    assert.equal(emptiedNotes.ok, true)
+    d = await read()
+    assert.equal(d.hasNotes, false)
+    assert.equal(d.notes, null)
+
+    // Emptying what is already empty changes nothing at all.
+    const again = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 3 }, clear: ['rating'] }, exec(),
+    )
+    assert.equal(again.data.receipt.outcome, 'unchanged')
+    assert.equal(again.data.receipt.revision, 3)
+    assert.equal((await read()).revision, 3)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: clearing a review needs the same confirmation as replacing one', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: UUID, title: '完美的日子', media_type: 'movie', status: 'completed', notes: '值得重看', revision: 1 },
+    ])
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+    const stopped = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 1 }, clear: ['notes'] }, exec(),
+    )
+    assert.equal(stopped.error.code, 'CONFIRMATION_REQUIRED')
+    assert.match(stopped.error.message, /清空/)
+    assert.equal((await get.execute({ assetId: UUID }, exec())).data.revision, 1)
+
+    const confirmed = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 1 }, clear: ['notes'], replaceNotes: true }, exec(),
+    )
+    assert.equal(confirmed.ok, true)
+    assert.equal((await get.execute({ assetId: UUID }, exec())).data.hasNotes, false)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: metadata and clear are rejected on create, and contradictions are caught', async () => {
+  const s = scratch()
+  try {
+    const { mark } = await harness({ databasePath: s.dbPath })
+    const bad = [
+      { target: { title: '新片', mediaType: 'movie' }, metadata: { year: 2024 } },
+      { target: { title: '新片', mediaType: 'movie' }, clear: ['rating'] },
+      { target: { assetId: UUID, expectedRevision: 1 }, metadata: {} },
+      { target: { assetId: UUID, expectedRevision: 1 }, metadata: { title: '  ' } },
+      { target: { assetId: UUID, expectedRevision: 1 }, metadata: { mediaType: 'music' } },
+      { target: { assetId: UUID, expectedRevision: 1 }, metadata: { year: 12 } },
+      { target: { assetId: UUID, expectedRevision: 1 }, clear: [] },
+      { target: { assetId: UUID, expectedRevision: 1 }, clear: ['title'] },
+      { target: { assetId: UUID, expectedRevision: 1 }, clear: ['nope'] },
+      { target: { assetId: UUID, expectedRevision: 1 }, clear: ['rating'], rating: 8 },
+      { target: { assetId: UUID, expectedRevision: 1 }, clear: ['year'], metadata: { year: 2024 } },
+      { target: { assetId: UUID, expectedRevision: 1 }, clear: ['progress'], progress: { current: 1 } },
+      { target: { assetId: UUID, expectedRevision: 1 }, clear: ['notes'], notes: '新的' },
+    ]
+    for (const args of bad) {
+      const value = await mark.execute(args, exec())
+      assert.equal(value.ok, false, JSON.stringify(args))
+      assert.equal(value.error.code, 'INVALID_ARGUMENT', JSON.stringify(args))
+    }
+    // Wrong SHAPES are caught by defineTool's schema gate, which throws rather
+    // than returning a value — the same layering as everywhere else.
+    await assert.rejects(
+      mark.execute({ target: { assetId: UUID, expectedRevision: 1 }, clear: 'rating' }, exec()),
+      /must be an array/,
+    )
+    await assert.rejects(
+      mark.execute({ target: { assetId: UUID, expectedRevision: 1 }, metadata: { nope: 1 } }, exec()),
+      /not a declared property/,
+    )
+    assert.throws(() => statSync(s.dbPath), 'a rejected call must not create the library')
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: a metadata patch still respects the observed revision', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: UUID, title: '沙丘', media_type: 'movie', status: 'completed', revision: 4 },
+    ])
+    const { mark } = await harness({ databasePath: s.dbPath })
+    const stale = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 3 }, metadata: { year: 2024 } }, exec(),
+    )
+    assert.equal(stale.error.code, 'STALE_REVISION')
+    assert.equal(stale.error.currentRevision, 4)
+    const fresh = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 4 }, metadata: { year: 2024 } }, exec(),
+    )
+    assert.equal(fresh.ok, true)
+    assert.equal(fresh.data.receipt.revision, 5)
+  } finally {
+    s.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// archive / restore
+// ---------------------------------------------------------------------------
+
+test('update: archiving stamps archived_at, hides from the list, and keeps search finding it', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      {
+        id: UUID,
+        title: '重复录入的一条',
+        media_type: 'movie',
+        year: 2020,
+        status: 'in_progress',
+        rating: 7,
+        progress_current: 2,
+        progress_total: 5,
+        progress_unit: '小时',
+        notes: '有点印象',
+        revision: 3,
+      },
+    ])
+    const { mark, get, list, search } = await harness({ databasePath: s.dbPath })
+    const before = await get.execute({ assetId: UUID }, exec())
+
+    const archived = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 3 }, lifecycle: 'archived' }, exec(),
+    )
+    assert.equal(archived.ok, true)
+    assert.equal(archived.data.receipt.revision, 4)
+    assert.equal(archived.data.media.lifecycle, 'archived')
+
+    const after = await get.execute({ assetId: UUID }, exec())
+    assert.equal(after.data.lifecycle, 'archived')
+    assert.ok(Number.isFinite(Date.parse(after.data.archivedAt ?? '')), 'archived_at is stamped')
+    // Nothing else moved.
+    for (const key of ['status', 'rating', 'startedAt', 'completedAt', 'title', 'year']) {
+      assert.equal(after.data[key], before.data[key], key)
+    }
+    assert.equal((await get.execute({ assetId: UUID, includeNotes: true }, exec())).data.hasNotes, true)
+
+    // Hidden from the default list, still findable by search.
+    const page = await list.execute({}, exec())
+    assert.deepEqual(page.data.items.map((i) => i.assetId), [])
+    const found = await search.execute({ query: '重复录入' }, exec())
+    assert.equal(found.data.items.length, 1)
+    assert.equal(found.data.items[0].lifecycle, 'archived')
+    assert.match(render(search, { query: '重复录入' }, found), /已归档/)
+
+    const text = render(mark, { target: { assetId: UUID, expectedRevision: 3 }, lifecycle: 'archived' }, archived)
+    assert.match(text, /^已更新《重复录入的一条》，在看\/在玩，已归档/)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: restoring clears archived_at and brings back id, rating, progress and review', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      {
+        id: UUID,
+        title: '归档过的一条',
+        media_type: 'game',
+        year: 2019,
+        status: 'paused',
+        rating: 6,
+        progress_current: 4,
+        progress_total: 20,
+        progress_unit: '章',
+        notes: '以后可能重玩',
+        lifecycle: 'archived',
+        revision: 2,
+        archived_at: '2025-03-01T00:00:00.000Z',
+      },
+    ])
+    const { mark, get, list } = await harness({ databasePath: s.dbPath })
+    const restored = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 2 }, lifecycle: 'active' }, exec(),
+    )
+    assert.equal(restored.ok, true)
+    const after = await get.execute({ assetId: UUID, includeNotes: true }, exec())
+    assert.equal(after.data.lifecycle, 'active')
+    assert.equal(after.data.archivedAt, null, 'restoring clears the archive date')
+    assert.equal(after.data.assetId, UUID)
+    assert.equal(after.data.rating, 6)
+    assert.deepEqual(after.data.progress, { current: 4, total: 20, unit: '章' })
+    assert.equal(after.data.hasNotes, true)
+    assert.equal(after.data.status, 'paused', 'restoring does not touch the watch state')
+
+    const page = await list.execute({}, exec())
+    assert.deepEqual(page.data.items.map((i) => i.assetId), [UUID])
+
+    // Re-archiving stamps a fresh date rather than resurrecting the old one.
+    const again = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 3 }, lifecycle: 'archived' }, exec(),
+    )
+    assert.equal(again.ok, true)
+    const rearchived = await get.execute({ assetId: UUID }, exec())
+    assert.notEqual(rearchived.data.archivedAt, '2025-03-01T00:00:00.000Z')
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: archiving twice does not bump the revision, and does not touch the status', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: UUID, title: '完美的日子', media_type: 'movie', status: 'in_progress', revision: 1 },
+    ])
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+    await mark.execute({ target: { assetId: UUID, expectedRevision: 1 }, lifecycle: 'archived' }, exec())
+    const twice = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 2 }, lifecycle: 'archived' }, exec(),
+    )
+    assert.equal(twice.data.receipt.outcome, 'unchanged')
+    assert.equal(twice.data.receipt.revision, 2)
+    const after = await get.execute({ assetId: UUID }, exec())
+    assert.equal(after.data.revision, 2)
+    assert.equal(after.data.status, 'in_progress', 'archiving is not a watch state')
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: an archived record with this exact title still blocks a create', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: UUID, title: '完美的日子', media_type: 'movie', status: 'completed', lifecycle: 'archived' },
+    ])
+    const { mark, list } = await harness({ databasePath: s.dbPath })
+    // The known boundary: archiving a duplicate does NOT free up the title.
+    const blocked = await mark.execute(
+      { target: { title: '完美的日子', mediaType: 'movie' }, status: 'completed' }, exec(),
+    )
+    assert.equal(blocked.error.code, 'TARGET_CONFLICT')
+    assert.equal(blocked.error.candidates[0].lifecycle, 'archived')
+    const visible = await list.execute({ lifecycle: 'all' }, exec())
+    assert.equal(visible.data.items.length, 1)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: lifecycle is rejected on create', async () => {
+  const s = scratch()
+  try {
+    const { mark } = await harness({ databasePath: s.dbPath })
+    for (const bad of [
+      { target: { title: '新片', mediaType: 'movie' }, lifecycle: 'archived' },
+      { target: { title: '新片', mediaType: 'movie' }, lifecycle: 'all' },
+      { target: { assetId: UUID, expectedRevision: 1 }, lifecycle: 'deleted' },
+    ]) {
+      const value = await mark.execute(bad, exec())
+      assert.equal(value.ok, false, JSON.stringify(bad))
+      assert.equal(value.error.code, 'INVALID_ARGUMENT', JSON.stringify(bad))
+    }
+  } finally {
+    s.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// update by title
+// ---------------------------------------------------------------------------
+
+test('updateByTitle: one call finishes the most common operations', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: UUID, title: '艾尔登法环', media_type: 'game', status: 'planned', revision: 1 },
+      { id: 'bbbbbbbb-2222-3333-4444-555555555555', title: '塞尔达传说', media_type: 'game', status: 'in_progress', progress_current: 12, progress_total: 50, progress_unit: '小时', revision: 4 },
+    ])
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+
+    const started = await mark.execute({ target: { title: '艾尔登法环' }, status: 'in_progress' }, exec())
+    assert.equal(started.ok, true)
+    assert.equal(started.data.receipt.assetId, UUID)
+    assert.equal(started.data.receipt.revision, 2)
+    assert.equal((await get.execute({ assetId: UUID }, exec())).data.status, 'in_progress')
+
+    const rated = await mark.execute({ target: { title: '塞尔达传说' }, rating: 9 }, exec())
+    assert.equal(rated.ok, true)
+    assert.equal(rated.data.receipt.assetId, 'bbbbbbbb-2222-3333-4444-555555555555')
+    assert.equal(rated.data.receipt.revision, 5)
+
+    const archived = await mark.execute({ target: { title: '塞尔达传说' }, lifecycle: 'archived' }, exec())
+    assert.equal(archived.ok, true)
+    assert.equal(archived.data.media.lifecycle, 'archived')
+
+    // Correcting identity works through the same door.
+    const renamed = await mark.execute(
+      { target: { title: '艾尔登法环' }, metadata: { title: '艾尔登法环：黄金树' } }, exec(),
+    )
+    assert.equal(renamed.ok, true)
+    assert.equal((await get.execute({ assetId: UUID }, exec())).data.title, '艾尔登法环：黄金树')
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('updateByTitle: a near-miss title offers the close records instead of guessing', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: UUID, title: '沙丘：第二部', media_type: 'movie', status: 'completed', revision: 2 },
+      { id: 'bbbbbbbb-2222-3333-4444-555555555555', title: '沙丘', media_type: 'movie', status: 'completed', revision: 1 },
+    ])
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+
+    // "沙丘2" shares no substring with either stored title, so nothing is
+    // offered rather than something wrong. Matching is exact on purpose.
+    const nothing = await mark.execute({ target: { title: '沙丘2' }, status: 'in_progress' }, exec())
+    assert.equal(nothing.error.code, 'TARGET_CONFLICT')
+    assert.deepEqual(nothing.error.candidates, [])
+    assert.match(render(mark, { target: { title: '沙丘2' } }, nothing), /补上 mediaType/)
+
+    // A title that IS a prefix of a stored one gets that record offered.
+    const near = await mark.execute({ target: { title: '沙丘：第' }, status: 'in_progress' }, exec())
+    assert.equal(near.error.code, 'TARGET_CONFLICT')
+    assert.equal(near.error.candidates.length, 1)
+    assert.equal(near.error.candidates[0].title, '沙丘：第二部')
+    const text = render(mark, { target: { title: '沙丘：第' } }, near)
+    assert.match(text, /确切标题重试/)
+    // Nothing was written.
+    assert.equal((await get.execute({ assetId: UUID }, exec())).data.revision, 2)
+    assert.equal((await get.execute({ assetId: UUID }, exec())).data.status, 'completed')
+
+    // Retrying with the stored title lands.
+    const retried = await mark.execute({ target: { title: '沙丘：第二部' }, status: 'in_progress' }, exec())
+    assert.equal(retried.ok, true)
+    assert.equal(retried.data.receipt.assetId, UUID)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('updateByTitle: an unknown title says how to create instead', async () => {
+  const s = scratch()
+  try {
+    const { mark } = await harness({ databasePath: s.dbPath })
+    const value = await mark.execute({ target: { title: '不存在的片子' }, status: 'completed' }, exec())
+    assert.equal(value.error.code, 'TARGET_CONFLICT')
+    assert.deepEqual(value.error.candidates, [])
+    const text = render(mark, { target: { title: '不存在的片子' } }, value)
+    assert.match(text, /没有这条记录/)
+    assert.match(text, /补上 mediaType/)
+
+    const created = await mark.execute(
+      { target: { title: '不存在的片子', mediaType: 'movie' }, status: 'completed' }, exec(),
+    )
+    assert.equal(created.ok, true)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('updateByTitle: several exact matches stop and ask, and a patch is required', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: UUID, title: '完美的日子', media_type: 'movie', status: 'completed' },
+      { id: 'bbbbbbbb-2222-3333-4444-555555555555', title: '完美的日子', media_type: 'anime', status: 'completed' },
+    ])
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+    const ambiguous = await mark.execute({ target: { title: '完美的日子' }, rating: 8 }, exec())
+    assert.equal(ambiguous.error.code, 'TARGET_CONFLICT')
+    assert.equal(ambiguous.error.candidates.length, 2)
+    assert.match(ambiguous.error.message, /多条/)
+    assert.equal((await get.execute({ assetId: UUID }, exec())).data.rating, null)
+
+    for (const bad of [
+      { target: { title: '完美的日子' } },
+      { target: { title: '完美的日子', year: 2024 }, rating: 8 },
+      { target: { title: '完美的日子', expectedRevision: 1 }, rating: 8 },
+      { target: { assetId: UUID, expectedRevision: 1, title: '完美的日子' }, rating: 8 },
+      { target: { assetId: UUID, expectedRevision: 1, mediaType: 'movie' }, rating: 8 },
+    ]) {
+      const value = await mark.execute(bad, exec())
+      assert.equal(value.ok, false, JSON.stringify(bad))
+      assert.equal(value.error.code, 'INVALID_ARGUMENT', JSON.stringify(bad))
+    }
+    // mediaType in target is the create signal, so this is a create that hits
+    // the existing title — and the failure tells the model to retry by title.
+    const asCreate = await mark.execute(
+      { target: { title: '完美的日子', mediaType: 'movie' }, rating: 8 }, exec(),
+    )
+    assert.equal(asCreate.error.code, 'TARGET_CONFLICT')
+    assert.match(render(mark, { target: { title: '完美的日子' } }, asCreate), /换成 target \{title\}/)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('updateByTitle: the notes guard and the rename guard still apply', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: UUID, title: '繁花', media_type: 'tv', status: 'completed', notes: '王家卫还是稳', revision: 1 },
+      { id: 'bbbbbbbb-2222-3333-4444-555555555555', title: '漫长的季节', media_type: 'tv', status: 'completed', revision: 1 },
+    ])
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+    const stopped = await mark.execute(
+      { target: { title: '繁花' }, notes: '不太行' }, exec(),
+    )
+    assert.equal(stopped.error.code, 'CONFIRMATION_REQUIRED')
+    const replaced = await mark.execute(
+      { target: { title: '繁花' }, notes: '不太行', replaceNotes: true }, exec(),
+    )
+    assert.equal(replaced.ok, true)
+
+    // Renaming onto an existing title is refused on this path too.
+    const clash = await mark.execute(
+      { target: { title: '繁花' }, metadata: { title: '漫长的季节' } }, exec(),
+    )
+    assert.equal(clash.error.code, 'TARGET_CONFLICT')
+    assert.equal((await get.execute({ assetId: 'bbbbbbbb-2222-3333-4444-555555555555' }, exec())).data.title, '漫长的季节')
   } finally {
     s.cleanup()
   }
@@ -344,6 +1100,25 @@ test('update: setting notes where none existed needs no replaceNotes', async () 
     assert.equal(value.ok, true)
     const back = await get.execute({ assetId: UUID, includeNotes: true }, exec())
     assert.equal(back.data.notes, '第一条短评')
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('update: an imported empty review accepts its first notes without confirmation', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [{ id: UUID, title: '空短评', media_type: 'movie', status: 'completed', notes: '' }])
+    const { mark, get } = await harness({ databasePath: s.dbPath })
+    const before = await get.execute({ assetId: UUID }, exec())
+    assert.equal(before.data.hasNotes, false)
+    const value = await mark.execute(
+      { target: { assetId: UUID, expectedRevision: 1 }, notes: '第一条短评' }, exec(),
+    )
+    assert.equal(value.ok, true)
+    const back = await get.execute({ assetId: UUID, includeNotes: true }, exec())
+    assert.equal(back.data.notes, '第一条短评')
+    assert.equal(back.data.completedAt, null, 'a notes-only patch must not invent a completion date')
   } finally {
     s.cleanup()
   }
@@ -441,6 +1216,244 @@ test('search: an empty page is a success', async () => {
 })
 
 // ---------------------------------------------------------------------------
+// list
+// ---------------------------------------------------------------------------
+
+/** Deterministic ids, so a page's contents are stable across runs. */
+const rowId = (n) => `0000000${n}-2222-3333-4444-555555555555`
+
+/** seed() stamps every row with the same updated_at — which is exactly what an
+ *  imported library looks like, and what makes the id tiebreak load-bearing. */
+const MIXED_LIBRARY = [
+  { id: rowId(1), title: '艾尔登法环', media_type: 'game', year: 2022, status: 'in_progress', rating: 9, progress_current: 3, progress_total: 50, progress_unit: '小时' },
+  { id: rowId(2), title: '塞尔达传说', media_type: 'game', year: 2023, status: 'in_progress', progress_current: 12, progress_total: 50, progress_unit: '小时' },
+  { id: rowId(3), title: '存档里的老游戏', media_type: 'game', year: 2019, status: 'in_progress', progress_current: 1, progress_total: 10, progress_unit: '章', lifecycle: 'archived' },
+  { id: rowId(4), title: '沙丘', media_type: 'movie', year: 2021, status: 'completed', rating: 8, completed_at: '2025-07-09T00:00:00+00:00' },
+  { id: rowId(5), title: '想看的一部', media_type: 'movie', year: 2020, status: 'planned' },
+  { id: rowId(6), title: '搁置的剧', media_type: 'tv', year: 2018, status: 'paused' },
+]
+
+const titles = (page) => page.data.items.map((i) => i.title).sort()
+
+test('list: "在玩什么" answers with active games only, rating and progress included', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, MIXED_LIBRARY)
+    const { list } = await harness({ databasePath: s.dbPath })
+    const page = await list.execute({ mediaType: 'game', status: 'in_progress' }, exec())
+    assert.equal(page.ok, true)
+    assert.deepEqual(titles(page), ['塞尔达传说', '艾尔登法环'])
+    assert.equal(page.data.total, 2)
+    assert.equal(page.data.filters.lifecycle, 'active', 'the invisible default must be echoed back')
+    for (const item of page.data.items) {
+      assert.deepEqual(
+        Object.keys(item).sort(),
+        ['assetId', 'lifecycle', 'mediaType', 'progress', 'rating', 'status', 'title', 'year'],
+        'only whitelisted fields cross into the session',
+      )
+    }
+    const ring = page.data.items.find((i) => i.title === '艾尔登法环')
+    assert.equal(ring.rating, 9)
+    assert.deepEqual(ring.progress, { current: 3, total: 50, unit: '小时' })
+    assert.equal(page.data.items.find((i) => i.title === '塞尔达传说').rating, null)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('list: the real page output renders as an answer, not a retrieval report', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, MIXED_LIBRARY)
+    const { list } = await harness({ databasePath: s.dbPath })
+    const args = { mediaType: 'game', status: 'in_progress' }
+    const text = render(list, args, await list.execute(args, exec()))
+    assert.match(text, /^在玩的游戏有 2 个：/)
+    assert.match(text, /《艾尔登法环》（2022年游戏，在玩，4\.5 星，进度 3\/50小时）assetId=/)
+    assert.match(text, /《塞尔达传说》（2023年游戏，在玩，进度 12\/50小时）assetId=/)
+    assert.doesNotMatch(text, /候选/, 'a list is an answer, not a set of candidates')
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('list: paging is stable across a shared updated_at, and an over-run page says so', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, MIXED_LIBRARY)
+    const { list } = await harness({ databasePath: s.dbPath })
+    /** @type {string[]} */
+    const seen = []
+    for (const offset of [0, 2, 4]) {
+      const page = await list.execute({ lifecycle: 'all', limit: 2, offset }, exec())
+      assert.equal(page.ok, true)
+      assert.equal(page.data.items.length, 2)
+      for (const item of page.data.items) {
+        assert.ok(!seen.includes(item.assetId), 'a record must not appear on two pages')
+        seen.push(item.assetId)
+      }
+    }
+    assert.equal(seen.length, MIXED_LIBRARY.length, 'every record shows up exactly once')
+    const first = await list.execute({ lifecycle: 'all', limit: 2, offset: 0 }, exec())
+    assert.equal(first.data.total, null, 'a window that is not exhausted proves nothing')
+    assert.match(render(list, { lifecycle: 'all', limit: 2 }, first), /结果未穷尽/)
+
+    const past = await list.execute({ lifecycle: 'all', limit: 2, offset: 6 }, exec())
+    assert.equal(past.ok, true)
+    assert.deepEqual(past.data.items, [])
+    assert.equal(past.data.total, MIXED_LIBRARY.length)
+    const text = render(list, { lifecycle: 'all', limit: 2, offset: 6 }, past)
+    assert.match(text, /这一页是空的/)
+    assert.doesNotMatch(text, /没有符合条件的记录/, 'an over-run page is not an empty library')
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('list: a completion range includes its start and excludes its end, across both date spellings', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: rowId(1), title: 'imported-spelling', media_type: 'movie', status: 'completed', completed_at: '2025-07-09T00:00:00+00:00' },
+      { id: rowId(2), title: 'written-here', media_type: 'movie', status: 'completed', completed_at: '2025-07-09T00:00:00.000Z' },
+      { id: rowId(3), title: 'no-date', media_type: 'movie', status: 'completed' },
+      { id: rowId(4), title: 'earlier', media_type: 'movie', status: 'completed', completed_at: '2025-07-08T20:00:00.000Z' },
+      { id: rowId(5), title: 'other-month', media_type: 'movie', status: 'completed', completed_at: '2025-08-15T00:00:00.000Z' },
+    ])
+    const { list } = await harness({ databasePath: s.dbPath })
+    const ask = async (extra) => titles(await list.execute(extra, exec()))
+
+    assert.deepEqual(
+      await ask({ completedFrom: '2025-07-09' }),
+      ['imported-spelling', 'other-month', 'written-here'],
+      'the start is inclusive, and a record without completed_at never enters a range',
+    )
+    assert.deepEqual(
+      await ask({ completedBefore: '2025-07-09' }),
+      ['earlier'],
+      'the end is exclusive — text comparison would have kept both boundary rows',
+    )
+    assert.deepEqual(
+      await ask({ completedFrom: '2025-07-01', completedBefore: '2025-08-01' }),
+      ['earlier', 'imported-spelling', 'written-here'],
+    )
+    // 2025-07-09T08:00:00+08:00 IS 2025-07-09T00:00:00Z. Read as a bare UTC
+    // datetime instead, the bound would sit eight hours later and both
+    // boundary rows would slip in — so this assertion is what proves the
+    // offset is honored rather than discarded.
+    assert.deepEqual(await ask({ completedBefore: '2025-07-09T08:00:00+08:00' }), ['earlier'])
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('list: lifecycle defaults to active; archived and all are explicit', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, MIXED_LIBRARY)
+    const { list } = await harness({ databasePath: s.dbPath })
+    assert.deepEqual(titles(await list.execute({ mediaType: 'game' }, exec())), ['塞尔达传说', '艾尔登法环'])
+    assert.deepEqual(titles(await list.execute({ lifecycle: 'archived' }, exec())), ['存档里的老游戏'])
+
+    const all = await list.execute({ lifecycle: 'all' }, exec())
+    assert.equal(all.data.items.length, MIXED_LIBRARY.length)
+    const text = render(list, { lifecycle: 'all' }, all)
+    assert.match(text, /含已归档/)
+    assert.match(text, /《存档里的老游戏》（2019年游戏，在玩，进度 1\/10章，已归档）assetId=/)
+    assert.match(text, /《想看的一部》（2020年电影，想看）assetId=/)
+    const archivedOnly = await list.execute({ lifecycle: 'archived' }, exec())
+    assert.match(render(list, { lifecycle: 'archived' }, archivedOnly), /只看已归档/)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('list: every stored status is filterable, including the ones mark cannot write yet', async () => {
+  const s = scratch()
+  try {
+    await seed(
+      s.dbPath,
+      ['planned', 'in_progress', 'completed', 'paused', 'dropped'].map((status, i) => ({
+        id: rowId(i + 1),
+        title: `记录-${status}`,
+        media_type: 'movie',
+        status,
+      })),
+    )
+    const { list } = await harness({ databasePath: s.dbPath })
+    for (const status of ['planned', 'in_progress', 'completed', 'paused', 'dropped']) {
+      const page = await list.execute({ status }, exec())
+      assert.deepEqual(titles(page), [`记录-${status}`], status)
+    }
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('list: an empty library is an honest answer, not a failure', async () => {
+  const s = scratch()
+  try {
+    const { list } = await harness({ databasePath: s.dbPath })
+    const page = await list.execute({}, exec())
+    assert.equal(page.ok, true)
+    assert.deepEqual(page.data.items, [])
+    assert.equal(page.data.total, 0)
+    assert.match(render(list, {}, page), /没有符合条件的记录/)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('list: a query leaves the records and their revisions untouched', async () => {
+  const s = scratch()
+  try {
+    await seed(s.dbPath, [
+      { id: UUID, title: '完美的日子', media_type: 'movie', status: 'completed', revision: 4, rating: 7 },
+    ])
+    const { list, get } = await harness({ databasePath: s.dbPath })
+    const before = await get.execute({ assetId: UUID }, exec())
+    await list.execute({ status: 'completed' }, exec())
+    await list.execute({ lifecycle: 'all', limit: 1 }, exec())
+    await list.execute({ completedFrom: '2025-01-01', completedBefore: '2026-01-01' }, exec())
+    const after = await get.execute({ assetId: UUID }, exec())
+    assert.deepEqual(after.data, before.data)
+    assert.equal(after.data.revision, 4)
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('list: argument validation runs before the library is even opened', async () => {
+  const s = scratch()
+  try {
+    const { list } = await harness({ databasePath: s.dbPath })
+    for (const bad of [
+      { mediaType: 'music' },
+      { status: 'watching' },
+      { lifecycle: 'deleted' },
+      { completedFrom: '上个月' },
+      { completedFrom: '2025-13-01' },
+      { completedFrom: '2025-11-01T00:00:00' },
+      { limit: 0 },
+      { offset: -1 },
+      { sortBy: 'title' },
+      { completedFrom: '2025-12-01', completedBefore: '2025-11-01' },
+    ]) {
+      const value = await list.execute(bad, exec())
+      assert.equal(value.ok, false, JSON.stringify(bad))
+      assert.equal(value.error.code, 'INVALID_ARGUMENT', JSON.stringify(bad))
+    }
+    // A wrong TYPE is caught by defineTool's own schema gate, which throws
+    // rather than returning a value — the layering the other tools share.
+    await assert.rejects(list.execute({ completedFrom: 20251101 }, exec()), /must be a string/)
+    await assert.rejects(list.execute({ limit: 2.5 }, exec()), /must be an integer/)
+    assert.throws(() => statSync(s.dbPath), 'a rejected call must not create the library')
+  } finally {
+    s.cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
 // get
 // ---------------------------------------------------------------------------
 
@@ -451,9 +1464,14 @@ test('get: notes excluded by default, truncated when long', async () => {
     const { get } = await harness({ databasePath: s.dbPath })
     const bare = await get.execute({ assetId: UUID }, exec())
     assert.equal('notes' in bare.data, false)
+    assert.doesNotMatch(render(get, { assetId: UUID }, bare), /x{20}/)
     const full = await get.execute({ assetId: UUID, includeNotes: true }, exec())
     assert.equal(full.data.notes.length, 2000)
     assert.equal(full.data.notesTruncated, true)
+    const text = render(get, { assetId: UUID, includeNotes: true }, full)
+    assert.ok(text.includes('x'.repeat(2000)), 'the model must receive the actual review')
+    assert.ok(!text.includes('x'.repeat(2001)), 'the model must not receive text beyond the limit')
+    assert.match(text, /截断/)
   } finally {
     s.cleanup()
   }
@@ -478,7 +1496,11 @@ test('get: the real tool output renders instead of falling through', async () =>
   const s = scratch()
   try {
     await seed(s.dbPath, [
-      { id: UUID, title: '寻梦环游记', media_type: 'movie', year: 2017, status: 'completed', rating: 8 },
+      {
+        id: UUID, title: '寻梦环游记', media_type: 'movie', year: 2017, status: 'completed', rating: 8,
+        progress_total: 105, progress_unit: '分钟',
+        started_at: '2025-07-09T00:00:00Z', completed_at: '2025-07-09T02:00:00Z',
+      },
     ])
     const { get } = await harness({ databasePath: s.dbPath })
     const value = await get.execute({ assetId: UUID }, exec())
@@ -487,6 +1509,11 @@ test('get: the real tool output renders instead of falling through', async () =>
     assert.match(text, /《寻梦环游记》/)
     assert.match(text, /已看完\/玩完/)
     assert.match(text, /4 星/)
+    assert.match(text, /2017年/)
+    assert.match(text, /电影/)
+    assert.match(text, /105分钟/)
+    assert.ok(text.includes(value.data.startedAt))
+    assert.ok(text.includes(value.data.completedAt))
     assert.match(text, new RegExp(`assetId=${UUID}`))
     assert.match(text, /revision=1/)
     assert.doesNotMatch(text, /意外结构/)
@@ -613,8 +1640,35 @@ test('a changed databasePath reopens and gets its own statement set', async () =
     const secondTracker = trackPrepares(second)
     await search.execute({ query: 'x' }, exec())
     assert.equal(secondTracker.n, 0, 'the new handle caches too')
-    assert.equal(firstTracker.n, 0, 'the closed handle is left alone')
+    assert.equal(firstTracker.n, 0, 'the previous handle is left alone')
+    first.close()
     second.close()
+  } finally {
+    s.cleanup()
+  }
+})
+
+test('overlapping marks for different configured paths write to their intended libraries', async () => {
+  const s = scratch()
+  try {
+    const otherPath = join(s.dir, 'other.db')
+    let databasePath = s.dbPath
+    const holder = createLibraryHolder()
+    const [mark] = createTools(() => ({ databasePath, writeEnabled: true }), holder)
+    const first = mark.execute({ target: { title: '第一库', mediaType: 'movie' }, status: 'completed' }, exec())
+    databasePath = otherPath
+    const second = mark.execute({ target: { title: '第二库', mediaType: 'movie' }, status: 'completed' }, exec())
+    const values = await Promise.all([first, second])
+    assert.ok(values.every((v) => v.ok))
+    const a = await holder(s.dbPath)
+    const b = await holder(otherPath)
+    try {
+      assert.deepEqual(a.prepare('SELECT title FROM media').all().map((r) => r.title), ['第一库'])
+      assert.deepEqual(b.prepare('SELECT title FROM media').all().map((r) => r.title), ['第二库'])
+    } finally {
+      a.close()
+      b.close()
+    }
   } finally {
     s.cleanup()
   }
@@ -676,7 +1730,8 @@ test('render: a conflict lists the candidates the model can act on', async () =>
     assert.match(text, /《完美的日子》/)
     assert.match(text, /2023年/)
     assert.match(text, new RegExp(`assetId=${UUID}`))
-    assert.match(text, /回复想用哪一个/)
+    assert.match(text, /换成 target \{title\}/, 'the next step is named, not left to guesswork')
+    assert.doesNotMatch(text, /确认.*新建/)
 
     const page = render(search, {}, {
       ok: true,
@@ -749,9 +1804,14 @@ test('render: imported planned/paused/dropped statuses have labels', () => {
   assert.match(render(get, {}, { ok: true, data: { assetId: UUID, title: 'x', status: 'dropped' } }), /弃了/)
 })
 
-test('the three tools are registered with the expected names', () => {
+test('the four tools are registered with the expected names', () => {
   const tools = createTools(() => ({ databasePath: '', writeEnabled: false }), async () => {
     throw new Error('unused')
   })
-  assert.deepEqual(tools.map((t) => t.name), ['media_log_mark', 'media_log_search', 'media_log_get'])
+  assert.deepEqual(tools.map((t) => t.name), [
+    'media_log_mark',
+    'media_log_search',
+    'media_log_get',
+    'media_log_list',
+  ])
 })

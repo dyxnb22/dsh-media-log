@@ -1,9 +1,13 @@
-// dsh-media-log — host entry. Registers the three media_log_* tools over the
-// plugin's own SQLite library. Pure ESM; @deepseek-ai/dsh-tools and
-// @deepseek-ai/schemastery are host-provided peers.
+// dsh-media-log — host entry. Registers the media_log_*, subscription_*,
+// software_* tools over the plugin's own SQLite library. Pure ESM;
+// @deepseek-ai/dsh-tools and @deepseek-ai/schemastery are host-provided peers.
 
 import z from '@deepseek-ai/schemastery'
-import { createTools, createLibraryHolder } from './tools.js'
+import { createTools } from './tools.js'
+import { createSubscriptionTools } from './subscription-tools.js'
+import { createSoftwareTools } from './software.js'
+import { createChangesTool } from './changes.js'
+import { createLibraryHolder } from './db.js'
 import { resolveConfig } from './config.js'
 
 /** Plugin display name, shown in loader diagnostics. */
@@ -33,7 +37,12 @@ export const Config = z.object({
  */
 export function apply(ctx, config = {}) {
   const getLibrary = createLibraryHolder()
-  const tools = createTools(() => resolveConfig(config), getLibrary)
+  const tools = [
+    ...createTools(() => resolveConfig(config), getLibrary),
+    ...createSubscriptionTools(() => resolveConfig(config), getLibrary),
+    ...createSoftwareTools(() => resolveConfig(config), getLibrary),
+    ...createChangesTool(() => resolveConfig(config), getLibrary),
+  ]
   for (const tool of tools) {
     ctx.tools.register(tool)
   }

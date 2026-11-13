@@ -5,10 +5,9 @@
 // With the library in-process there is no machine envelope to parse, no exit
 // code to interpret and no subprocess that can die mid-write, so the whole
 // CLI-failure vocabulary (CLI_NOT_FOUND, CLI_INCOMPATIBLE, PROTOCOL_ERROR,
-// CLI_FAILURE, TIMEOUT, QUEUE_BUSY, DB_BUSY, LIBRARY_UNAVAILABLE,
-// WRITE_OUTCOME_UNKNOWN) is gone. What remains is the domain's own
-// vocabulary, which SQLite enforces directly through CHECK constraints and
-// the revision guard.
+// CLI_FAILURE, TIMEOUT, QUEUE_BUSY, WRITE_OUTCOME_UNKNOWN) is gone. SQLite
+// contention and file errors still use DB_BUSY and LIBRARY_UNAVAILABLE.
+// CHECK constraints and the revision guard enforce domain rejections.
 
 /** Success envelope. @param {unknown} data */
 export function ok(data) {
@@ -16,16 +15,42 @@ export function ok(data) {
 }
 
 /**
+ * Runs one storage operation, mapping a domain rejection onto a tool value.
+ * Shared by every module's tools, so a constraint violation reads the same
+ * way whichever tool tripped it.
+ * @template T
+ * @param {() => T} fn
+ * @returns {T | ReturnType<typeof fail>}
+ */
+export function attemptSqlite(fn) {
+  try {
+    return fn()
+  } catch (error) {
+    return sqliteErrorToValue(error)
+  }
+}
+
+/** @returns {boolean} true when a value is a tool failure envelope */
+export function isFail(value) {
+  return typeof value === 'object' && value !== null && /** @type {any} */ (value).ok === false
+}
+
+/**
  * Failure envelope.
  * @param {string} code stable tool code
  * @param {string} message agent-readable, phone-renderable text
- * @param {{assetId?: string, candidates?: unknown[], currentRevision?: number}} [extra]
+ * @param {{assetId?: string, candidates?: unknown[], currentRevision?: number, hint?: string}} [extra]
+ *  `hint` is the next step the caller should take. It exists because the right
+ *  next step differs per path: after a by-id conflict you must re-read the
+ *  revision, after a by-title conflict you can simply retry with the right
+ *  title.
  */
 export function fail(code, message, extra = {}) {
   const error = { code, message }
   if (extra.assetId !== undefined) error.assetId = extra.assetId
   if (extra.candidates !== undefined) error.candidates = extra.candidates
   if (extra.currentRevision !== undefined) error.currentRevision = extra.currentRevision
+  if (extra.hint !== undefined) error.hint = extra.hint
   return { ok: false, error }
 }
 
@@ -33,8 +58,7 @@ export function fail(code, message, extra = {}) {
  * SQLite extended result codes in the constraint family. node:sqlite reports
  * `code: 'ERR_SQLITE_ERROR'` and puts the real result code in `errcode`, so
  * matching on `code` alone never fires.
- */
-const SQLITE_CONSTRAINT = 19
+ */const SQLITE_CONSTRAINT = 19
 const SQLITE_CONSTRAINT_UNIQUE = 2067
 const SQLITE_CONSTRAINT_NOTNULL = 1299
 const SQLITE_CONSTRAINT_CHECK = 275
