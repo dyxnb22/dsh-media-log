@@ -637,3 +637,67 @@ export function classifyCandidates(items, title) {
   if (active.length === 1) return { kind: 'unique', candidate: active[0], candidates: active }
   return { kind: 'ambiguous', candidates: matches }
 }
+
+/** Where media_log_draws its "tonight" candidates from. 'planned' is the
+ *  natural reading of "今晚看什么"; 'paused' is the recovery path. */
+const PICK_SOURCES = ['planned', 'paused', 'both']
+const PICK_MAX = 5
+
+/**
+ * Validates the media_log_pick arguments. All optional: "今晚看什么" arrives
+ * as an empty call and still means something.
+ * @param {unknown} args
+ * @returns {{ok: true, value: {from: 'planned'|'paused'|'both', mediaType: string|null, count: number}} | {ok: false, message: string}}
+ */
+export function validatePickArgs(args) {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+    return { ok: false, message: '参数必须是一个对象。' }
+  }
+  const a = /** @type {Record<string, unknown>} */ (args)
+  for (const key of Object.keys(a)) {
+    if (!['from', 'mediaType', 'count'].includes(key)) {
+      return { ok: false, message: `未知参数字段 ${key}。` }
+    }
+  }
+  /** @type {{from: 'planned'|'paused'|'both', mediaType: string|null, count: number}} */
+  const value = { from: 'planned', mediaType: null, count: 3 }
+  if (a.from !== undefined) {
+    if (typeof a.from !== 'string' || !PICK_SOURCES.includes(a.from)) {
+      return { ok: false, message: 'from 只接受 planned、paused、both。' }
+    }
+    value.from = /** @type {'planned'|'paused'|'both'} */ (a.from)
+  }
+  if (a.mediaType !== undefined) {
+    if (typeof a.mediaType !== 'string' || !MEDIA_TYPES.includes(a.mediaType)) {
+      return { ok: false, message: 'mediaType 只接受 movie、tv、anime、game。' }
+    }
+    value.mediaType = a.mediaType
+  }
+  if (a.count !== undefined) {
+    if (typeof a.count !== 'number' || !Number.isInteger(a.count) || a.count < 1 || a.count > PICK_MAX) {
+      return { ok: false, message: `count 必须是 1 到 ${PICK_MAX} 的整数。` }
+    }
+    value.count = a.count
+  }
+  return { ok: true, value }
+}
+
+/**
+ * Picks up to `count` DISTINCT candidates by uniform random draw. Equal odds
+ * on purpose: the record never claims to know what you feel like tonight, so
+ * any weighting would be theater. `rng` is injectable so tests pin the draw.
+ * @template T
+ * @param {T[]} items
+ * @param {number} count
+ * @param {() => number} [rng]
+ * @returns {T[]}
+ */
+export function pickCandidates(items, count, rng = Math.random) {
+  const pool = items.slice()
+  const picked = []
+  while (picked.length < count && pool.length > 0) {
+    const index = Math.floor(rng() * pool.length)
+    picked.push(pool.splice(index, 1)[0])
+  }
+  return picked
+}

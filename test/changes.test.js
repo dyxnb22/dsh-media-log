@@ -56,7 +56,7 @@ test('the host exposes 11 tools and exports only the supported tables', async ()
   try {
     const { tools, mark, changes } = await harness({ databasePath: s.dbPath })
     assert.deepEqual(tools.map((tool) => tool.name), [
-      'media_log_mark', 'media_log_search', 'media_log_get', 'media_log_list',
+      'media_log_mark', 'media_log_pick', 'media_log_search', 'media_log_get', 'media_log_list',
       'subscription_mark', 'subscription_list', 'subscription_get',
       'software_mark', 'software_list', 'software_get', 'media_log_changes',
     ])

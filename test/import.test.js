@@ -205,7 +205,7 @@ test('importer CLI rejects a missing --to value without writing the default dest
 async function harnessAt(dbPath) {
   const holder = createLibraryHolder()
   const tools = createTools(() => ({ databasePath: dbPath, writeEnabled: true }), holder)
-  const [mark, search, get] = tools
+  const [mark, , search, get] = tools
   return { mark, search, get, getLibrary: holder }
 }
 

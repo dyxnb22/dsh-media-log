@@ -26,6 +26,8 @@ import {
   validateSearchArgs,
   validateGetArgs,
   validateListArgs,
+  validatePickArgs,
+  pickCandidates,
   mapCandidate,
   mapListItem,
   mapDetail,
@@ -281,6 +283,27 @@ function renderValue(args, value) {
         text: `${parts.join('，')}。（assetId=${receipt.assetId}，revision=${receipt.revision}）`,
       },
     ]
+  }
+  // A pick page announces its source — that is the discriminator against the
+  // search page (which has items but no `from`).
+  if (data.from !== undefined) {
+    if (!Array.isArray(data.items) || data.items.length === 0) {
+      const label =
+        data.from === 'paused'
+          ? '没有搁置中的记录。'
+          : data.from === 'both'
+            ? '想看和搁置的清单都空着。'
+            : '想看清单还空着。'
+      return [{ type: 'text', text: `${label}先记几部，再来挑。` }]
+    }
+    const source = data.from === 'paused' ? '搁置' : data.from === 'both' ? '想看和搁置' : '想看'
+    const lines = [`从${source}清单的 ${data.total} 部里挑了 ${data.items.length} 部：`]
+    for (const item of data.items) {
+      const year = item.year ? `${item.year}年` : ''
+      lines.push(`- 《${item.title}》（${year}${MEDIA_TYPE_ZH[item.mediaType] ?? item.mediaType}）assetId=${item.assetId}`)
+    }
+    lines.push('挑好了说一声，我帮你标成在看；都不合胃口就再挑一次。')
+    return [{ type: 'text', text: lines.join('\n') }]
   }
   // A list page carries the filters it answered with; a search page does not.
   // That is the discriminator, and it doubles as an echo so the model can see
@@ -775,5 +798,47 @@ export function createTools(getConfig, getLibrary) {
     },
   })
 
-  return [markTool, searchTool, getTool, listTool]
+  const pickTool = defineTool({
+    name: 'media_log_pick',
+    description:
+      "Pick something to watch or play tonight FROM YOUR OWN recorded backlog: '今晚看什么', '随便挑一部', '搁置的里有没有能捡回来的'. Draws uniformly at random from planned (default), paused, or both — it NEVER invents titles and never looks anything up. mediaType narrows the pool; count (1-5, default 3) sets how many options come back. Read-only; the pool size is reported so '从 218 部里挑' stays honest.",
+    parameters: {
+      from: { type: 'string', description: 'planned (default) | paused | both — which list to draw from.' },
+      mediaType: { type: 'string', description: 'movie | tv | anime | game. Omit for all types.' },
+      count: { type: 'integer', description: 'How many to pick, 1-5, default 3.' },
+    },
+    ...toolCommon,
+    async execute(args, exec) {
+      if (exec.signal?.aborted) {
+        return fail('CANCELLED', '这次查询在开始前就被取消了。')
+      }
+      const cfg = resolveConfig(getConfig())
+      const notReady = ensureReady(cfg, { isWrite: false })
+      if (notReady) return notReady
+      const validation = validatePickArgs(args)
+      if (!validation.ok) return fail('INVALID_ARGUMENT', validation.message)
+      const q = validation.value
+      const db = await getLibrary(cfg.databasePath)
+      const st = statements(db, buildStatements)
+      return attemptSqlite(() => {
+        const wanted = q.from === 'both' ? ['planned', 'paused'] : [q.from]
+        const pool = st.candidates
+          .all()
+          .filter(
+            (r) =>
+              r.lifecycle === 'active' &&
+              wanted.includes(r.status) &&
+              (q.mediaType === null || r.media_type === q.mediaType),
+          )
+        return ok({
+          items: pickCandidates(pool, q.count).map(mapCandidate),
+          from: q.from,
+          mediaType: q.mediaType,
+          total: pool.length,
+        })
+      })
+    },
+  })
+
+  return [markTool, pickTool, searchTool, getTool, listTool]
 }

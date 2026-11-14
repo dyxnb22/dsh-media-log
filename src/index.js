@@ -9,6 +9,7 @@ import { createSoftwareTools } from './software.js'
 import { createChangesTool } from './changes.js'
 import { createLibraryHolder } from './db.js'
 import { resolveConfig } from './config.js'
+import { registerOverviewRoute } from './overview.js'
 
 /** Plugin display name, shown in loader diagnostics. */
 export const name = 'dsh-media-log'
@@ -46,6 +47,9 @@ export function apply(ctx, config = {}) {
   for (const tool of tools) {
     ctx.tools.register(tool)
   }
+  // The sidebar overview route: scoped to profiles that have a web server,
+  // so headless deployments never wait on services they do not have.
+  registerOverviewRoute(ctx, () => resolveConfig(config), getLibrary)
   const listed = tools.map((tool) => `${tool.name}=${ctx.tools.get(tool.name) !== undefined}`).join(', ')
   const cfg = resolveConfig(config)
   console.log(

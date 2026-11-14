@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createTools } from '../src/tools.js'
+import { pickCandidates } from '../src/media.js'
 import { openLibrary, resolveDatabasePath, inTransaction, createLibraryHolder } from '../src/db.js'
 
 const UUID = '11111111-2222-3333-4444-555555555555'
@@ -24,8 +25,8 @@ function scratch() {
 async function harness({ databasePath = '', writeEnabled = true } = {}) {
   const getLibrary = createLibraryHolder()
   const tools = createTools(() => ({ databasePath, writeEnabled }), getLibrary)
-  const [mark, search, get, list] = tools
-  return { mark, search, get, list, getLibrary }
+  const [mark, pick, search, get, list] = tools
+  return { mark, pick, search, get, list, getLibrary }
 }
 
 const exec = (signal) => ({ signal: signal ?? new AbortController().signal })
@@ -149,6 +150,7 @@ test('a relative databasePath is rejected before anything is opened', async () =
   )
   const args = [
     { target: { assetId: UUID, expectedRevision: 1 }, rating: 8 },
+    { from: 'planned' },
     { query: '片名' },
     { assetId: UUID },
     { status: 'planned' },
@@ -1607,7 +1609,7 @@ test('prepared statements are built once per library, not per call', async () =>
     await seed(s.dbPath, [{ id: UUID, title: '完美的日子', media_type: 'movie', status: 'completed' }])
     let databasePath = s.dbPath
     const holder = createLibraryHolder()
-    const [, search, get] = createTools(() => ({ databasePath, writeEnabled: true }), holder)
+    const [, , search, get] = createTools(() => ({ databasePath, writeEnabled: true }), holder)
 
     await search.execute({ query: '完美' }, exec())
     const db = await holder(s.dbPath)
@@ -1627,7 +1629,7 @@ test('a changed databasePath reopens and gets its own statement set', async () =
   try {
     let databasePath = s.dbPath
     const holder = createLibraryHolder()
-    const [, search] = createTools(() => ({ databasePath, writeEnabled: true }), holder)
+    const [, , search] = createTools(() => ({ databasePath, writeEnabled: true }), holder)
 
     await search.execute({ query: 'x' }, exec())
     const first = await holder(s.dbPath)
@@ -1804,14 +1806,130 @@ test('render: imported planned/paused/dropped statuses have labels', () => {
   assert.match(render(get, {}, { ok: true, data: { assetId: UUID, title: 'x', status: 'dropped' } }), /弃了/)
 })
 
-test('the four tools are registered with the expected names', () => {
+test('the five media tools are registered with the expected names', () => {
   const tools = createTools(() => ({ databasePath: '', writeEnabled: false }), async () => {
     throw new Error('unused')
   })
   assert.deepEqual(tools.map((t) => t.name), [
     'media_log_mark',
+    'media_log_pick',
     'media_log_search',
     'media_log_get',
     'media_log_list',
   ])
+})
+
+test('pick: draws only from the active planned pool, reports its size, excludes paused/completed/archived', async () => {
+  const { dbPath, cleanup } = scratch()
+  try {
+    const h = await harness({ databasePath: dbPath })
+    await seed(dbPath, [
+      { id: UUID, title: '想看A', media_type: 'movie', status: 'planned' },
+      { id: '22222222-2222-3333-4444-555555555555', title: '想看B', media_type: 'anime', status: 'planned' },
+      { id: '33333333-2222-3333-4444-555555555555', title: '搁置C', media_type: 'game', status: 'paused' },
+      { id: '44444444-2222-3333-4444-555555555555', title: '看完D', media_type: 'movie', status: 'completed' },
+      { id: '55555555-2222-3333-4444-555555555555', title: '归档E', media_type: 'movie', status: 'planned', lifecycle: 'archived' },
+    ])
+    const value = await h.pick.execute({}, exec())
+    assert.equal(value.ok, true)
+    assert.equal(value.data.from, 'planned')
+    assert.equal(value.data.total, 2) // 想看A + 想看B only
+    assert.equal(value.data.items.length, 2) // pool smaller than count=3 → whole pool
+    assert.deepEqual(
+      value.data.items.map((i) => i.title).sort(),
+      ['想看A', '想看B'],
+    )
+    assert.ok(value.data.items.every((i) => i.assetId))
+  } finally {
+    cleanup()
+  }
+})
+
+test('pick: from=paused and from=both switch the pool; mediaType narrows it', async () => {
+  const { dbPath, cleanup } = scratch()
+  try {
+    const h = await harness({ databasePath: dbPath })
+    await seed(dbPath, [
+      { id: UUID, title: '想看A', media_type: 'movie', status: 'planned' },
+      { id: '33333333-2222-3333-4444-555555555555', title: '搁置C', media_type: 'game', status: 'paused' },
+      { id: '66666666-2222-3333-4444-555555555555', title: '搁置D', media_type: 'movie', status: 'paused' },
+    ])
+    const paused = await h.pick.execute({ from: 'paused' }, exec())
+    assert.equal(paused.data.total, 2)
+    assert.deepEqual(paused.data.items.map((i) => i.title).sort(), ['搁置C', '搁置D'])
+
+    const both = await h.pick.execute({ from: 'both' }, exec())
+    assert.equal(both.data.total, 3)
+
+    const movies = await h.pick.execute({ from: 'both', mediaType: 'movie' }, exec())
+    assert.equal(movies.data.total, 2)
+    assert.ok(movies.data.items.every((i) => i.mediaType === 'movie'))
+  } finally {
+    cleanup()
+  }
+})
+
+test('pick: an empty pool is an honest ok with a hint, not an error', async () => {
+  const { dbPath, cleanup } = scratch()
+  try {
+    const h = await harness({ databasePath: dbPath })
+    const value = await h.pick.execute({}, exec())
+    assert.equal(value.ok, true)
+    assert.deepEqual(value.data.items, [])
+    assert.equal(value.data.total, 0)
+    const text = render(h.pick, {}, value)
+    assert.match(text, /想看清单还空着/)
+    const pausedValue = await h.pick.execute({ from: 'paused' }, exec())
+    assert.match(render(h.pick, {}, pausedValue), /没有搁置中的记录/)
+  } finally {
+    cleanup()
+  }
+})
+
+test('pick: argument validation runs before the library is opened', async () => {
+  const { dbPath, cleanup } = scratch() // NEVER '' — that is the real library
+  try {
+    const h = await harness({ databasePath: dbPath })
+    for (const args of [{ from: 'completed' }, { count: 0 }, { count: 6 }, { nope: 1 }]) {
+      const value = await h.pick.execute(args, exec())
+      assert.equal(value.ok, false, JSON.stringify(args))
+      assert.equal(value.error.code, 'INVALID_ARGUMENT')
+    }
+    const ok1 = await h.pick.execute({ count: 1 }, exec())
+    assert.equal(ok1.ok, true)
+    assert.equal(ok1.data.items.length, 0) // empty temp library → empty pick
+  } finally {
+    cleanup()
+  }
+})
+
+test('pick: render names the source and the next step', async () => {
+  const { dbPath, cleanup } = scratch()
+  try {
+    const h = await harness({ databasePath: dbPath })
+    await seed(dbPath, [
+      { id: UUID, title: '沙丘2', media_type: 'movie', year: 2024, status: 'planned' },
+      { id: '22222222-2222-3333-4444-555555555555', title: '艾尔登法环', media_type: 'game', status: 'planned' },
+    ])
+    const value = await h.pick.execute({ count: 1 }, exec())
+    const text = render(h.pick, {}, value)
+    assert.match(text, /从想看清单的 2 部里挑了 1 部/)
+    assert.match(text, /《沙丘2》|《艾尔登法环》/)
+    assert.match(text, /标成在看/)
+  } finally {
+    cleanup()
+  }
+})
+
+test('pickCandidates: injectable rng picks deterministically, never repeats, never exceeds the pool', () => {
+  let calls = 0
+  const seq = [0.9, 0.0, 0.5, 0.99, 0.1]
+  const rng = () => seq[calls++ % seq.length]
+  const pool = ['a', 'b', 'c', 'd']
+  const picked = pickCandidates(pool, 3, rng)
+  assert.equal(picked.length, 3)
+  assert.equal(new Set(picked).size, 3)
+  assert.deepEqual(picked, ['d', 'a', 'c']) // 0.9*4→3='d'; 0*3→0='a'; 0.5*2→1='c'
+  assert.deepEqual(pool, ['a', 'b', 'c', 'd']) // input untouched
+  assert.equal(pickCandidates(['x'], 5, rng).length, 1) // pool < count → whole pool
 })

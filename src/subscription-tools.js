@@ -267,6 +267,12 @@ function renderValue(args, value) {
     if (typeof data.monthlyMinor === 'number' && data.monthlyMinor !== data.amountMinor) {
       parts.push(`月均约 ${money(data.monthlyMinor, data.currency)}`)
     }
+    // The yearly cost of a monthly subscription — the same arithmetic the
+    // monthly estimate makes, read in the other direction. A yearly row is
+    // its own annual figure, so saying it twice is noise; usage has no figure.
+    if (data.cycle === 'monthly' && typeof data.amountMinor === 'number' && data.amountMinor > 0) {
+      parts.push(`年化约 ${money(data.amountMinor * 12, data.currency)}`)
+    }
     const lines = [
       `${parts.join('，')}（assetId=${data.assetId}，revision=${data.revision}，${data.lifecycle === 'archived' ? '已归档' : '活跃'}）。`,
     ]
