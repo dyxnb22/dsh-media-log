@@ -19,7 +19,7 @@ DeepSeek Harness 插件：把「手机一句话入库」变成一次工具调用
 | `software_get` | 按 UUID 读取软件详情与当前 revision |
 | `media_log_changes` | 跨模块的最近改动：三个模块写入时各记一行，含动了哪些字段；只保留最近 500 条 |
 
-后续功能的优先级、范围和验收见[功能迁移开发计划](docs/feature-migration-plan.md)。计划项不代表当前版本已经支持。
+后续未触发功能的候选与实施约定见[功能迁移开发计划](docs/feature-migration-plan.md)。计划项不代表当前版本已经支持。
 
 资料库是**插件自己的一个 SQLite 文件**，直接开在 Host 进程里——不调外部 CLI、不过任
 何机器契约。工具返回 `{ok:true, data}` 或 `{ok:false, error:{code, message, ...}}`。
@@ -27,16 +27,10 @@ DeepSeek Harness 插件：把「手机一句话入库」变成一次工具调用
 ## 为什么是独立的
 
 上一个版本（`dsh-asset-mesh`）是「薄客户端」：插件 → `assetmesh` CLI 子进程 → SQLite。
-那个边界让 1742 行里约 710 行只为了「隔着一个进程」而存在，而且让「这次写入到底落库
-没有」只能推测——子进程可能在任何时刻死掉，于是有 `WRITE_OUTCOME_UNKNOWN` 和「请先查
-询再决定是否重试」这种要把用户拉进来的说法。
-
-直连 SQLite 之后，**工具在事务提交成功后返回回执**，Host 存活时能直接判断提交结果。
-如果 Host 在提交后、回执送达前退出，重试前仍需查询记录。顺带消失的还有 CLI 版本门槛、
-机器契约同步、argv 注入面、跨进程写队列、输出上限与 kill 升级。
-
-代价是丢掉 AssetMesh 桌面端互通，以及完整的活动历史（评分/状态的变更时间线）。当前只保留
-最近 500 条改动摘要，不提供完整时间线或撤销。
+约一半代码只为隔着这个进程而存在，而且子进程可能在任何时刻死掉，「这次写入到底落库没有」
+只能推测（`WRITE_OUTCOME_UNKNOWN`）。直连 SQLite 之后，**工具在事务提交成功后返回回执**，
+Host 存活时能直接判断提交结果；Host 在提交后、回执送达前退出的极端情况，重试前仍需查询记录。
+代价是丢掉 AssetMesh 桌面端互通和完整的活动历史（评分/状态的变更时间线）。
 
 ## 前置条件
 
@@ -69,25 +63,19 @@ node scripts/import-assetmesh.mjs --from "/Users/me/Library/Application Support/
 ## 安全边界
 
 - 工具只读写资料字段，**没有 argv、没有 shell、没有子进程**，这些工具不会执行存下来的命令。
-- 单连接 + 同步 API，写入在本 Host 内天然串行，不需要队列。
-- 读-比对-写在**同一个事务**里完成，并发写入插不进来。
+- 单连接 + 同步 API，写入在本 Host 内天然串行；读-比对-写在**同一个事务**里完成，并发写入
+  插不进来。
 - 更新带 `expectedRevision`：读到之后被改过会得到 `STALE_REVISION` 并告知当前 revision，
-  不会被静默覆盖。**按标题更新不需要它**——工具在同一个事务里自己定位并读取 revision，
-  这条路不可能过期。
+  不会被静默覆盖；同值重提得到 `unchanged`，revision 不动。**按标题更新不需要它**——工具
+  在同一个事务里自己定位并读取 revision，这条路不可能过期。
 - 三种指定目标的方式：`target {assetId, expectedRevision}` 按 UUID 改；`target {title}` 加上
   要改的字段按标题改（拼写不一致时返回最接近的记录，不猜）；`target {title, mediaType}` 新建。
   `mediaType` 是"这是新作品"的信号，所以它在不在 target 里就是新建和更新的分界。
-- 新建在写事务里检查完整的同名候选，命中就停下返回 `TARGET_CONFLICT` 和可操作的
-  `assetId`；当前不支持同名新建，需选择已有条目更新。
-- 进入 `in_progress` 补 `started_at`，进入 `completed` 补 `completed_at`，各补各的、已有
-  日期保留、重看不改写历史；同值重提不改日期或 revision，单独更新评分/进度/短评不会补写
-  历史日期。
-- 新短评和已有短评不同、且未显式 `replaceNotes` 时，整次提交停在 `CONFIRMATION_REQUIRED`；
-  清空已有短评走同一个门。
-- 更新可以纠正标题/类型/年份（`metadata`）和清空评分/年份/短评/进度（`clear`）。清空不用
-  `null` 传值——`defineTool` 的 schema 不接受 `type: ['string','null']`，显式数组对模型也更
-  可靠。标题和类型是 NOT NULL，不接受清空；进度作为整体清空，不会留下只有单位的残值。
-- 改名撞上别的记录（**含已归档**）会停下返回 `TARGET_CONFLICT`，不会悄悄造出同名重复。
+- 新建或改名撞上别的同名记录（**含已归档**）都会停下返回 `TARGET_CONFLICT` 和可操作的
+  `assetId`，不会悄悄造出同名重复；当前不支持同名新建，需选择已有条目更新。
+- 更新可以纠正标题/类型/年份（`metadata`）和清空评分/年份/短评/进度（`clear`）：标题和类型
+  不接受清空，进度作为整体清空、不留下只有单位的残值。新短评和已有短评不同、且未显式
+  `replaceNotes` 时，整次提交停在 `CONFIRMATION_REQUIRED`，清空已有短评走同一个门。
 - `exec.signal` 在入口检查一次：已取消就直接不开始，资料库不会有半点改动。
 
 ## 错误码
@@ -96,9 +84,6 @@ node scripts/import-assetmesh.mjs --from "/Users/me/Library/Application Support/
 `STALE_REVISION` `CONFIRMATION_REQUIRED` `DB_BUSY` `LIBRARY_UNAVAILABLE` `CANCELLED`
 
 三个模块共用同一套错误码——同一个失败原因，无论撞在哪个工具上，读起来都一样。
-
-`CLI_*`、`QUEUE_BUSY`、`PROTOCOL_ERROR`、`TIMEOUT`、`WRITE_OUTCOME_UNKNOWN` 全部不再
-存在——它们的成因（子进程、跨进程排队、机器信封）已经没有了。
 
 ## 安装
 
@@ -168,11 +153,10 @@ tab 变为可见时拉取一次数据，也可以手动刷新；没有轮询、�
 当前未提供通用备忘、音乐、完整活动历史、非媒体导入、桌面端互通、标签/关系/重复审查。
 后续迁移按上面的计划逐项取舍，当前版本行为保持不变。`status` 收 5 个值
 （planned/in_progress/completed/paused/dropped），`media_log_mark` 全部接受，新建不带
-`status` 时记为 `planned`；`media_log_list` 也能按这 5 个状态筛选——导入的 218 条
-planned 现在可以直接被"列出想看的"问到。
+`status` 时记为 `planned`，`media_log_list` 也能按这 5 个状态筛选。
 
 改动日志（`media_log_changes`）从装上这一版才开始记，**不回填**之前的任何历史；只保留
-最近 500 条，更早的滚动清除；同值重提不记。它是"我上次改了什么"的答案，不是事件溯源——
+最近 500 条；同值重提不记。它是"我上次改了什么"的答案，不是事件溯源——
 没有回放、没有撤销、没有逐字段历史。
 
 两个非媒体模块都是**手工清单**，不是系统状态的镜子：
