@@ -70,10 +70,13 @@ const CONSTRAINT_CODES = new Set([
 ])
 const SQLITE_BUSY = 5
 const SQLITE_LOCKED = 6
+const SQLITE_FULL = 13
+const SQLITE_IOERR = 10
 const SQLITE_CORRUPT = 11
 const SQLITE_NOTADB = 26
 const SQLITE_CANTOPEN = 14
 const SQLITE_READONLY = 8
+const SQLITE_PERM = 3
 
 /**
  * Turns a SQLite error into a tool value. A constraint violation is the
@@ -98,7 +101,10 @@ export function sqliteErrorToValue(error) {
   if (errcode === SQLITE_CORRUPT || errcode === SQLITE_NOTADB) {
     return fail('LIBRARY_UNAVAILABLE', '资料库文件损坏或不是有效数据库。请从备份恢复。')
   }
-  if (errcode === SQLITE_CANTOPEN || errcode === SQLITE_READONLY) {
+  if (errcode === SQLITE_FULL || errcode === SQLITE_IOERR) {
+    return fail('LIBRARY_UNAVAILABLE', '资料库读写失败：磁盘可能已满或出现 IO 错误。本次没有保存，请检查磁盘后重试。')
+  }
+  if (errcode === SQLITE_CANTOPEN || errcode === SQLITE_READONLY || errcode === SQLITE_PERM) {
     return fail('LIBRARY_UNAVAILABLE', '资料库打不开。请检查 databasePath 指向的文件与权限。')
   }
   throw error

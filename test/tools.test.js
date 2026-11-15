@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { createTools } from '../src/tools.js'
 import { pickCandidates } from '../src/media.js'
 import { openLibrary, resolveDatabasePath, inTransaction, createLibraryHolder } from '../src/db.js'
+import { attemptSqlite } from '../src/errors.js'
 import { scratch, exec, render, byName } from './helpers.js'
 
 const UUID = '11111111-2222-3333-4444-555555555555'
@@ -143,7 +144,7 @@ test('a relative databasePath is rejected before anything is opened', async () =
   }
 })
 
-test('inTransaction preserves SQLITE_FULL after SQLite automatically rolls back', async () => {
+test('inTransaction preserves SQLITE_FULL, and the envelope reads it as LIBRARY_UNAVAILABLE', async () => {
   const s = scratch()
   const db = await openLibrary(s.dbPath)
   try {
@@ -164,6 +165,16 @@ test('inTransaction preserves SQLITE_FULL after SQLite automatically rolls back'
     )
     assert.equal(db.isTransaction, false)
     assert.deepEqual(db.prepare('SELECT * FROM media').all(), before)
+
+    // The same failure through the shared mapper is an environment problem,
+    // not a plugin bug: it surfaces as a clean LIBRARY_UNAVAILABLE value.
+    const mapped = attemptSqlite(() =>
+      inTransaction(db, () => {
+        insert.run('filler-x', '填充', 'movie', 'completed', 'x'.repeat(2000), '2026', '2026')
+      }),
+    )
+    assert.equal(mapped.ok, false)
+    assert.equal(mapped.error.code, 'LIBRARY_UNAVAILABLE')
   } finally {
     db.close()
     s.cleanup()
