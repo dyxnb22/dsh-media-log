@@ -29,20 +29,25 @@ window.__ModuleLoader__.load({
       return `${symbol}${(minor / 100).toFixed(2)}`
     }
 
+    /** Parses an ISO string into a Date, or null when unparseable — an
+     * unparseable value renders as the raw text, never 'Invalid Date'. */
+    function parsedDate(iso) {
+      const d = new Date(String(iso))
+      return Number.isNaN(d.getTime()) ? null : d
+    }
+    const two = (n) => String(n).padStart(2, '0')
+
     /** '2026-12-10T00:00:00.000Z' → '12-10', in the machine's zone — the same
      * wall-clock convention as the journal's whenText on the host. */
     function dayText(iso) {
-      const d = new Date(String(iso))
-      if (Number.isNaN(d.getTime())) return String(iso)
-      const two = (n) => String(n).padStart(2, '0')
-      return `${two(d.getMonth() + 1)}-${two(d.getDate())}`
+      const d = parsedDate(iso)
+      return d ? `${two(d.getMonth() + 1)}-${two(d.getDate())}` : String(iso)
     }
 
+    /** → '20:31' wall clock, the same machine-zone convention. */
     function timeText(iso) {
-      const d = new Date(String(iso))
-      if (Number.isNaN(d.getTime())) return String(iso)
-      const two = (n) => String(n).padStart(2, '0')
-      return `${two(d.getHours())}:${two(d.getMinutes())}`
+      const d = parsedDate(iso)
+      return d ? `${two(d.getHours())}:${two(d.getMinutes())}` : String(iso)
     }
 
     /** Badge cache: the overdue count the tab chip shows between fetches.
@@ -215,15 +220,26 @@ window.__ModuleLoader__.load({
       }
     }
 
-    const PosterRow = ({ title, side, titleText }) => {
-      const p = posterFor(title)
-      return h(
+    /** One row of a group: optional poster, text left, the actionable detail
+     *  right. The hover highlight lives on .mlrow (see the style tag below). */
+    const Row = ({ poster, main, side, title }) =>
+      h(
         'div',
-        { className: 'mlrow', style: S.row, title: titleText ?? title },
-        h('div', { style: { ...S.poster, background: p.background } }, p.children),
-        h('span', { style: S.rowMain }, title),
+        { className: 'mlrow', style: S.row, title },
+        poster ?? null,
+        h('span', { style: S.rowMain }, main),
         side ? h('span', { style: S.rowSide }, side) : null,
       )
+
+    /** The media-flavored row: a poster tile keyed by the title rides along. */
+    const PosterRow = ({ title, side, titleText }) => {
+      const p = posterFor(title)
+      return Row({
+        poster: h('div', { style: { ...S.poster, background: p.background } }, p.children),
+        main: title,
+        side,
+        title: titleText ?? title,
+      })
     }
 
     /** A titled group; renders nothing when items is empty. The overdue
