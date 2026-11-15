@@ -20,11 +20,10 @@ import {
 } from './db.js'
 import { ok, fail, attemptSqlite, isFail } from './errors.js'
 import { resolveConfig, ensureReady } from './config.js'
-import { toolOutput, unexpectedStructure, renderFailure, unchangedReceipt, changeSummary, textChange, recordChange } from './toolkit.js'
+import { toolOutput, unexpectedStructure, renderFailure, unchangedReceipt, changeSummary, textChange, recordChange, validateGetArgs } from './toolkit.js'
 import {
   validateMarkArgs,
   validateSearchArgs,
-  validateGetArgs,
   validateListArgs,
   validatePickArgs,
   pickCandidates,

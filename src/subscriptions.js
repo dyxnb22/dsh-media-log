@@ -8,8 +8,16 @@
 // future boundary) and stop there — no services, accounts or invoices.
 
 import { dateBound } from './dates.js'
+import {
+  UUID_RE,
+  NOTES_MAX,
+  usableText,
+  hasNoNul,
+  clearFields,
+  pageBounds,
+  notesField,
+} from './toolkit.js'
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 /** Two-decimal minor units are enough for both, so a monthly estimate is a
  *  plain division rather than a per-currency policy. */
 const CURRENCIES = ['CNY', 'USD']
@@ -34,12 +42,6 @@ const ROOT_KEYS = [
   'lifecycle',
 ]
 const TARGET_KEYS = ['assetId', 'expectedRevision', 'name']
-const NOTES_MAX = 2000
-
-/** @returns {boolean} false when the text contains NUL. */
-function hasNoNul(text) {
-  return !text.includes('\u0000')
-}
 
 /**
  * Validates the subscription_mark argument object.
@@ -105,10 +107,9 @@ export function validateMarkArgs(args) {
   }
 
   if (a.provider !== undefined) {
-    if (typeof a.provider !== 'string' || a.provider.trim().length < 1 || a.provider.trim().length > 200) {
-      return { ok: false, message: 'provider 需要 1 到 200 个字符。' }
-    }
-    value.provider = a.provider.trim()
+    const provider = usableText(a.provider, 200)
+    if (provider === null) return { ok: false, message: 'provider 需要 1 到 200 个字符。' }
+    value.provider = provider
   }
   if (a.amountMinor !== undefined) {
     if (
@@ -174,17 +175,9 @@ export function validateMarkArgs(args) {
 
   const clear = a.clear
   if (clear !== undefined) {
-    if (!Array.isArray(clear) || clear.length === 0) {
-      return { ok: false, message: 'clear 必须是非空数组。' }
-    }
-    /** @type {Array<'provider'|'amountMinor'|'nextRenewAt'|'expiresAt'|'notes'>} */
-    const fields = []
-    for (const entry of clear) {
-      if (typeof entry !== 'string' || !CLEARABLE.includes(entry)) {
-        return { ok: false, message: `clear 只接受 ${CLEARABLE.join('、')}。` }
-      }
-      if (!fields.includes(/** @type {any} */ (entry))) fields.push(/** @type {any} */ (entry))
-    }
+    const cleared = clearFields(a.clear, CLEARABLE)
+    if (!cleared.ok) return cleared
+    const fields = /** @type {Array<'provider'|'amountMinor'|'nextRenewAt'|'expiresAt'|'notes'>} */ (cleared.fields)
     value.clear = fields
     // Setting and emptying the same field in one call is a contradiction.
     for (const [field, given] of [
@@ -233,7 +226,8 @@ export function validateMarkArgs(args) {
   if (!hasName) {
     return { ok: false, message: '缺少 target：更新需 {assetId, expectedRevision}，新建需 {name}。' }
   }
-  if (typeof t.name !== 'string' || t.name.trim().length < 1 || t.name.trim().length > 200) {
+  const name = usableText(t.name, 200)
+  if (name === null) {
     return { ok: false, message: 'target.name 需要 1 到 200 个字符。' }
   }
   // The billing cycle is the one field that makes this a subscription rather
@@ -251,7 +245,7 @@ export function validateMarkArgs(args) {
     return { ok: false, message: 'lifecycle 只用于更新已有条目；新建的记录永远是 active。' }
   }
   value.mode = 'create'
-  value.name = t.name.trim()
+  value.name = name
   return { ok: true, value: /** @type {NormalizedMark} */ (value) }
 }
 
@@ -308,10 +302,9 @@ export function validateListArgs(args) {
   }
 
   if (a.name !== undefined) {
-    if (typeof a.name !== 'string' || a.name.trim().length < 1 || a.name.trim().length > 200) {
-      return { ok: false, message: 'name 需要 1 到 200 个字符。' }
-    }
-    value.name = a.name.trim()
+    const name = usableText(a.name, 200)
+    if (name === null) return { ok: false, message: 'name 需要 1 到 200 个字符。' }
+    value.name = name
   }
   if (a.cycle !== undefined) {
     if (typeof a.cycle !== 'string' || !CYCLES.includes(a.cycle)) {
@@ -347,43 +340,11 @@ export function validateListArgs(args) {
     return { ok: false, message: 'renewFrom 必须早于 renewBefore。' }
   }
 
-  if (a.limit !== undefined) {
-    if (typeof a.limit !== 'number' || !Number.isInteger(a.limit) || a.limit < 1 || a.limit > 20) {
-      return { ok: false, message: 'limit 必须是 1 到 20 的整数。' }
-    }
-    value.limit = a.limit
-  }
-  if (a.offset !== undefined) {
-    if (typeof a.offset !== 'number' || !Number.isInteger(a.offset) || a.offset < 0 || a.offset > 1000) {
-      return { ok: false, message: 'offset 必须是 0 到 1000 的整数。' }
-    }
-    value.offset = a.offset
-  }
+  const page = pageBounds(a)
+  if (!page.ok) return page
+  value.limit = page.limit
+  value.offset = page.offset
   return { ok: true, value }
-}
-
-/**
- * Validates the subscription_get arguments.
- * @param {unknown} args
- * @returns {{ok: true, value: {assetId: string, includeNotes: boolean}} | {ok: false, message: string}}
- */
-export function validateGetArgs(args) {
-  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
-    return { ok: false, message: '参数必须是一个对象。' }
-  }
-  const a = /** @type {Record<string, unknown>} */ (args)
-  for (const key of Object.keys(a)) {
-    if (!['assetId', 'includeNotes'].includes(key)) {
-      return { ok: false, message: `未知参数字段 ${key}。` }
-    }
-  }
-  if (typeof a.assetId !== 'string' || !UUID_RE.test(a.assetId)) {
-    return { ok: false, message: 'assetId 必须是完整 UUID。' }
-  }
-  if (a.includeNotes !== undefined && typeof a.includeNotes !== 'boolean') {
-    return { ok: false, message: 'includeNotes 必须是布尔值。' }
-  }
-  return { ok: true, value: { assetId: a.assetId, includeNotes: a.includeNotes === true } }
 }
 
 /**
@@ -444,8 +405,7 @@ export function mapListItem(row) {
  * @param {boolean} includeNotes
  */
 export function mapDetail(row, includeNotes) {
-  /** @type {Record<string, unknown>} */
-  const out = {
+  return {
     assetId: row.id ?? null,
     revision: row.revision ?? null,
     name: row.name ?? null,
@@ -460,15 +420,6 @@ export function mapDetail(row, includeNotes) {
     monthlyMinor: monthlyMinor(row),
     archivedAt: row.archived_at ?? null,
     hasNotes: typeof row.notes === 'string' && row.notes.length > 0,
+    ...notesField(row, includeNotes),
   }
-  if (includeNotes) {
-    const notes = typeof row.notes === 'string' ? row.notes : null
-    if (notes !== null && notes.length > NOTES_MAX) {
-      out.notes = notes.slice(0, NOTES_MAX)
-      out.notesTruncated = true
-    } else {
-      out.notes = notes
-    }
-  }
-  return out
 }

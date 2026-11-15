@@ -14,9 +14,24 @@ import { randomUUID } from 'node:crypto'
 import { inTransaction, statementCache, nowIso, likePattern, CHANGE_CAP } from './db.js'
 import { ok, fail, attemptSqlite, isFail } from './errors.js'
 import { resolveConfig, ensureReady } from './config.js'
-import { toolOutput, unexpectedStructure, renderFailure, unchangedReceipt, changeSummary, textChange, recordChange } from './toolkit.js'
+import {
+  toolOutput,
+  unexpectedStructure,
+  renderFailure,
+  unchangedReceipt,
+  changeSummary,
+  textChange,
+  recordChange,
+  UUID_RE,
+  NOTES_MAX,
+  usableText,
+  hasNoNul,
+  pageBounds,
+  clearFields,
+  notesField,
+  validateGetArgs,
+} from './toolkit.js'
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 /** in_use | retired. Retiring keeps the purpose and the notes. */
 const STATUSES = ['in_use', 'retired']
 const LIST_STATUSES = ['in_use', 'retired', 'all']
@@ -34,20 +49,7 @@ const ROOT_KEYS = [
   'clear',
 ]
 const TARGET_KEYS = ['assetId', 'expectedRevision', 'name']
-const NOTES_MAX = 2000
 const URL_MAX = 2000
-
-/** @returns {boolean} false when the text contains NUL. */
-function hasNoNul(text) {
-  return !text.includes('\u0000')
-}
-
-/** @returns {string | null} the trimmed text, or null when it is unusable */
-function usableText(value, max) {
-  if (typeof value !== 'string') return null
-  const trimmed = value.trim()
-  return trimmed.length >= 1 && trimmed.length <= max ? trimmed : null
-}
 
 /**
  * Validates the software_mark argument object. Only two ways to aim it: by id
@@ -150,17 +152,9 @@ export function validateMarkArgs(args) {
 
   const clear = a.clear
   if (clear !== undefined) {
-    if (!Array.isArray(clear) || clear.length === 0) {
-      return { ok: false, message: 'clear 必须是非空数组。' }
-    }
-    /** @type {Array<'category'|'purpose'|'sourceUrl'|'version'|'platform'|'notes'>} */
-    const fields = []
-    for (const entry of clear) {
-      if (typeof entry !== 'string' || !CLEARABLE.includes(entry)) {
-        return { ok: false, message: `clear 只接受 ${CLEARABLE.join('、')}。` }
-      }
-      if (!fields.includes(/** @type {any} */ (entry))) fields.push(/** @type {any} */ (entry))
-    }
+    const cleared = clearFields(a.clear, CLEARABLE)
+    if (!cleared.ok) return cleared
+    const fields = /** @type {Array<'category'|'purpose'|'sourceUrl'|'version'|'platform'|'notes'>} */ (cleared.fields)
     value.clear = fields
     // Setting and emptying the same field in one call is a contradiction.
     for (const field of fields) {
@@ -273,43 +267,11 @@ export function validateListArgs(args) {
     }
     value.status = /** @type {'in_use'|'retired'|'all'} */ (a.status)
   }
-  if (a.limit !== undefined) {
-    if (typeof a.limit !== 'number' || !Number.isInteger(a.limit) || a.limit < 1 || a.limit > 20) {
-      return { ok: false, message: 'limit 必须是 1 到 20 的整数。' }
-    }
-    value.limit = a.limit
-  }
-  if (a.offset !== undefined) {
-    if (typeof a.offset !== 'number' || !Number.isInteger(a.offset) || a.offset < 0 || a.offset > 1000) {
-      return { ok: false, message: 'offset 必须是 0 到 1000 的整数。' }
-    }
-    value.offset = a.offset
-  }
+  const page = pageBounds(a)
+  if (!page.ok) return page
+  value.limit = page.limit
+  value.offset = page.offset
   return { ok: true, value }
-}
-
-/**
- * Validates the software_get arguments.
- * @param {unknown} args
- * @returns {{ok: true, value: {assetId: string, includeNotes: boolean}} | {ok: false, message: string}}
- */
-export function validateGetArgs(args) {
-  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
-    return { ok: false, message: '参数必须是一个对象。' }
-  }
-  const a = /** @type {Record<string, unknown>} */ (args)
-  for (const key of Object.keys(a)) {
-    if (!['assetId', 'includeNotes'].includes(key)) {
-      return { ok: false, message: `未知参数字段 ${key}。` }
-    }
-  }
-  if (typeof a.assetId !== 'string' || !UUID_RE.test(a.assetId)) {
-    return { ok: false, message: 'assetId 必须是完整 UUID。' }
-  }
-  if (a.includeNotes !== undefined && typeof a.includeNotes !== 'boolean') {
-    return { ok: false, message: 'includeNotes 必须是布尔值。' }
-  }
-  return { ok: true, value: { assetId: a.assetId, includeNotes: a.includeNotes === true } }
 }
 
 /**
@@ -338,8 +300,7 @@ export function mapListItem(row) {
  * @param {boolean} includeNotes
  */
 export function mapDetail(row, includeNotes) {
-  /** @type {Record<string, unknown>} */
-  const out = {
+  return {
     assetId: row.id ?? null,
     revision: row.revision ?? null,
     name: row.name ?? null,
@@ -350,17 +311,8 @@ export function mapDetail(row, includeNotes) {
     platform: row.platform ?? null,
     status: row.status ?? null,
     hasNotes: typeof row.notes === 'string' && row.notes.length > 0,
+    ...notesField(row, includeNotes),
   }
-  if (includeNotes) {
-    const notes = typeof row.notes === 'string' ? row.notes : null
-    if (notes !== null && notes.length > NOTES_MAX) {
-      out.notes = notes.slice(0, NOTES_MAX)
-      out.notesTruncated = true
-    } else {
-      out.notes = notes
-    }
-  }
-  return out
 }
 
 /**

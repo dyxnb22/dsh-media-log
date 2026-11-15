@@ -4,7 +4,7 @@
 // (platform 'web'). The tab registers ONLY when the dsh-better-sidebar
 // service exists: registration sits inside a scoped ctx.inject, so a desktop
 // without that plugin (or a headless profile, which never loads this file at
-// all) simply gets nothing — the 11 host tools are untouched either way.
+// all) simply gets nothing — the 12 host tools are untouched either way.
 //
 // Data comes from the host half's GET /media-log/api/overview. The component
 // fetches when the tab becomes visible and on manual refresh; there is no

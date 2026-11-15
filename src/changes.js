@@ -7,10 +7,10 @@
 // enough to answer "我上次改了什么", not enough to replay anything.
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { statementCache } from './db.js'
+import { statementCache, CHANGE_CAP } from './db.js'
 import { ok, fail, attemptSqlite, isFail } from './errors.js'
 import { resolveConfig, ensureReady } from './config.js'
-import { toolOutput, unexpectedStructure } from './toolkit.js'
+import { toolOutput, unexpectedStructure, pageBounds } from './toolkit.js'
 
 const MODULES = ['media', 'subscription', 'software']
 const MODULE_ZH = { media: '媒体', subscription: '订阅', software: '软件' }
@@ -64,18 +64,10 @@ function validateArgs(args) {
     }
     value.module = a.module
   }
-  if (a.limit !== undefined) {
-    if (typeof a.limit !== 'number' || !Number.isInteger(a.limit) || a.limit < 1 || a.limit > 20) {
-      return { ok: false, message: 'limit 必须是 1 到 20 的整数。' }
-    }
-    value.limit = a.limit
-  }
-  if (a.offset !== undefined) {
-    if (typeof a.offset !== 'number' || !Number.isInteger(a.offset) || a.offset < 0 || a.offset > 1000) {
-      return { ok: false, message: 'offset 必须是 0 到 1000 的整数。' }
-    }
-    value.offset = a.offset
-  }
+  const page = pageBounds(a)
+  if (!page.ok) return page
+  value.limit = page.limit
+  value.offset = page.offset
   return { ok: true, value }
 }
 
@@ -117,7 +109,7 @@ function renderValue(args, value) {
   if (data.total === null) {
     lines.push('结果未穷尽，可继续翻页（把 offset 加上一页的 limit）。')
   }
-  lines.push('日志只保留最近 500 条，更早的已滚动清除；媒体、订阅和软件的当前状态用对应模块的 _get 查看。')
+  lines.push(`日志只保留最近 ${CHANGE_CAP} 条，更早的已滚动清除；媒体、订阅和软件的当前状态用对应模块的 _get 查看。`)
   return [{ type: 'text', text: lines.join('\n') }]
 }
 

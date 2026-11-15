@@ -4,8 +4,16 @@
 // fields cross into the session.
 
 import { dateBound } from './dates.js'
+import {
+  UUID_RE,
+  NOTES_MAX,
+  usableText,
+  hasNoNul,
+  pageBounds,
+  clearFields,
+  notesField,
+} from './toolkit.js'
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const MEDIA_TYPES = ['movie', 'tv', 'anime', 'game']
 /** All five stored statuses, accepted by both mark and list. */
 const MEDIA_STATUSES = ['planned', 'in_progress', 'completed', 'paused', 'dropped']
@@ -24,7 +32,6 @@ const LIST_KEYS = [
 /** Omitted on create, status defaults to planned — "记一下《沙丘2》"
  *  means "想看", and the model should not have to invent a state. */
 const DEFAULT_STATUS = 'planned'
-const NOTES_MAX = 2000
 const ROOT_KEYS = [
   'target',
   'status',
@@ -46,23 +53,9 @@ const CLEARABLE = ['rating', 'year', 'notes', 'progress']
 const MARK_LIFECYCLES = ['active', 'archived']
 /** Every key target accepts, across all three modes. */
 const TARGET_KEYS = ['assetId', 'expectedRevision', 'title', 'mediaType', 'year']
-/** @returns {string | null} the trimmed title, or null when it is unusable */
-function usableTitle(value) {
-  if (typeof value !== 'string') return null
-  const trimmed = value.trim()
-  return trimmed.length >= 1 && trimmed.length <= 300 ? trimmed : null
-}
 /** @returns {boolean} */
 function usableYear(value) {
   return typeof value === 'number' && Number.isInteger(value) && value >= 1850 && value <= 2100
-}
-
-/**
- * @param {string} text
- * @returns {boolean} false when the text contains NUL.
- */
-function hasNoNul(text) {
-  return !text.includes('\u0000')
 }
 
 /**
@@ -250,20 +243,9 @@ export function validateMarkArgs(args) {
 
   const clear = a.clear
   if (clear !== undefined) {
-    if (!Array.isArray(clear) || clear.length === 0) {
-      return { ok: false, message: 'clear 必须是非空数组。' }
-    }
-    /** @type {Array<'rating'|'year'|'notes'|'progress'>} */
-    const fields = []
-    for (const entry of clear) {
-      if (typeof entry !== 'string' || !CLEARABLE.includes(entry)) {
-        return {
-          ok: false,
-          message: `clear 只接受 ${CLEARABLE.join('、')}；标题和类型是必填项，不能清空。`,
-        }
-      }
-      if (!fields.includes(/** @type {any} */ (entry))) fields.push(/** @type {any} */ (entry))
-    }
+    const cleared = clearFields(a.clear, CLEARABLE, '；标题和类型是必填项，不能清空')
+    if (!cleared.ok) return cleared
+    const fields = /** @type {Array<'rating'|'year'|'notes'|'progress'>} */ (cleared.fields)
     value.clear = fields
     // Setting and emptying the same field in one call is a contradiction, and
     // a partial progress patch plus "empty the progress" is worse: it would
@@ -315,7 +297,7 @@ export function validateMarkArgs(args) {
     return { ok: true, value: /** @type {NormalizedMark} */ (value) }
 
   } else if (hasTitle && hasMediaType) {
-    const title = usableTitle(t.title)
+    const title = usableText(t.title, 300)
     if (title === null) {
       return { ok: false, message: 'target.title 需要 1 到 300 个字符。' }
     }
@@ -356,7 +338,7 @@ export function validateMarkArgs(args) {
         message: '按标题更新需要至少一个要改的字段（status/rating/progress/notes/metadata/clear/lifecycle）；要新建请在 target 里补上 mediaType。',
       }
     }
-    const title = usableTitle(t.title)
+    const title = usableText(t.title, 300)
     if (title === null) {
       return { ok: false, message: 'target.title 需要 1 到 300 个字符。' }
     }
@@ -395,45 +377,9 @@ export function validateSearchArgs(args) {
   if (typeof a.query !== 'string' || a.query.trim().length < 1 || a.query.trim().length > 300) {
     return { ok: false, message: 'query 需要 1 到 300 个字符。' }
   }
-  let limit = 10
-  if (a.limit !== undefined) {
-    if (typeof a.limit !== 'number' || !Number.isInteger(a.limit) || a.limit < 1 || a.limit > 20) {
-      return { ok: false, message: 'limit 必须是 1 到 20 的整数。' }
-    }
-    limit = a.limit
-  }
-  let offset = 0
-  if (a.offset !== undefined) {
-    if (typeof a.offset !== 'number' || !Number.isInteger(a.offset) || a.offset < 0 || a.offset > 1000) {
-      return { ok: false, message: 'offset 必须是 0 到 1000 的整数。' }
-    }
-    offset = a.offset
-  }
-  return { ok: true, value: { query: a.query.trim(), limit, offset } }
-}
-
-/**
- * Validates the media_log_get arguments.
- * @param {unknown} args
- * @returns {{ok: true, value: {assetId: string, includeNotes: boolean}} | {ok: false, message: string}}
- */
-export function validateGetArgs(args) {
-  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
-    return { ok: false, message: '参数必须是一个对象。' }
-  }
-  const a = /** @type {Record<string, unknown>} */ (args)
-  for (const key of Object.keys(a)) {
-    if (!['assetId', 'includeNotes'].includes(key)) {
-      return { ok: false, message: `未知参数字段 ${key}。` }
-    }
-  }
-  if (typeof a.assetId !== 'string' || !UUID_RE.test(a.assetId)) {
-    return { ok: false, message: 'assetId 必须是完整 UUID。' }
-  }
-  if (a.includeNotes !== undefined && typeof a.includeNotes !== 'boolean') {
-    return { ok: false, message: 'includeNotes 必须是布尔值。' }
-  }
-  return { ok: true, value: { assetId: a.assetId, includeNotes: a.includeNotes === true } }
+  const page = pageBounds(a)
+  if (!page.ok) return page
+  return { ok: true, value: { query: a.query.trim(), limit: page.limit, offset: page.offset } }
 }
 
 /**
@@ -517,18 +463,10 @@ export function validateListArgs(args) {
     }
   }
 
-  if (a.limit !== undefined) {
-    if (typeof a.limit !== 'number' || !Number.isInteger(a.limit) || a.limit < 1 || a.limit > 20) {
-      return { ok: false, message: 'limit 必须是 1 到 20 的整数。' }
-    }
-    value.limit = a.limit
-  }
-  if (a.offset !== undefined) {
-    if (typeof a.offset !== 'number' || !Number.isInteger(a.offset) || a.offset < 0 || a.offset > 1000) {
-      return { ok: false, message: 'offset 必须是 0 到 1000 的整数。' }
-    }
-    value.offset = a.offset
-  }
+  const page = pageBounds(a)
+  if (!page.ok) return page
+  value.limit = page.limit
+  value.offset = page.offset
   return { ok: true, value }
 }
 
@@ -573,8 +511,7 @@ function mapProgress(row) {
  * @param {boolean} includeNotes
  */
 export function mapDetail(row, includeNotes) {
-  /** @type {Record<string, unknown>} */
-  const out = {
+  return {
     assetId: row.id ?? null,
     revision: row.revision ?? null,
     title: row.title ?? null,
@@ -588,17 +525,8 @@ export function mapDetail(row, includeNotes) {
     completedAt: row.completed_at ?? null,
     archivedAt: row.archived_at ?? null,
     hasNotes: typeof row.notes === 'string' && row.notes.length > 0,
+    ...notesField(row, includeNotes),
   }
-  if (includeNotes) {
-    const notes = typeof row.notes === 'string' ? row.notes : null
-    if (notes !== null && notes.length > NOTES_MAX) {
-      out.notes = notes.slice(0, NOTES_MAX)
-      out.notesTruncated = true
-    } else {
-      out.notes = notes
-    }
-  }
-  return out
 }
 
 /**

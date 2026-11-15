@@ -9,7 +9,7 @@
 //
 // Registration is scoped: `ctx.inject(['webServer', 'connection'], …)` fires
 // only where those services exist (the desktop with a web server). In a
-// headless profile the callback never runs, and the 11 tools are unaffected —
+// headless profile the callback never runs, and the 12 tools are unaffected —
 // the overview is an ADD-ON to the tools, never a dependency of them.
 //
 // Route plumbing codes (FORBIDDEN / INTERNAL) are route-only and sit outside
