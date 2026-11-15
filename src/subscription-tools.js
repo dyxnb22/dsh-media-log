@@ -17,7 +17,7 @@ import {
   statementCache,
   nowIso,
   likePattern,
-  CHANGE_CAP,
+  journalStatements,
 } from './db.js'
 import { ok, fail, attemptSqlite, isFail } from './errors.js'
 import { resolveConfig, ensureReady } from './config.js'
@@ -78,13 +78,7 @@ function buildStatements(db) {
        ORDER BY next_renew_at IS NULL, next_renew_at ASC, id ASC LIMIT :limit OFFSET :offset`,
     ),
     listCount: db.prepare(`SELECT count(*) AS n FROM subscriptions${LIST_WHERE}`),
-    journal: db.prepare(
-      `INSERT INTO changes (at, module, asset_id, name, action, summary)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ),
-    journalTrim: db.prepare(
-      `DELETE FROM changes WHERE id <= (SELECT max(id) FROM changes) - ${CHANGE_CAP}`,
-    ),
+    ...journalStatements(db),
     // The monthly estimate is computed over EVERY matching row, not just the
     // page on screen, so paging cannot make the total shrink. Only the three
     // columns the estimate needs are projected.

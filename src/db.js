@@ -110,6 +110,24 @@ const USER_VERSION = 7
 export const CHANGE_CAP = 500
 
 /**
+ * The two journal statements every writing module shares. The SQL is
+ * identical across modules, so — unlike the module-specific statement sets —
+ * these are defined once here and spread into each module's statement object.
+ * @param {import('node:sqlite').DatabaseSync} db
+ */
+export function journalStatements(db) {
+  return {
+    journal: db.prepare(
+      `INSERT INTO changes (at, module, asset_id, name, action, summary)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ),
+    journalTrim: db.prepare(
+      `DELETE FROM changes WHERE id <= (SELECT max(id) FROM changes) - ${CHANGE_CAP}`,
+    ),
+  }
+}
+
+/**
  * The conventional library location: ~/.dsh/media-log/media.db. The Host
  * provides `dshHomePath` on every plugin context (dsh-app-boot), so no
  * dependency is needed — but a bare path keeps this module testable.

@@ -16,7 +16,7 @@ import {
   statementCache,
   nowIso,
   likePattern,
-  CHANGE_CAP,
+  journalStatements,
 } from './db.js'
 import { ok, fail, attemptSqlite, isFail } from './errors.js'
 import { resolveConfig, ensureReady } from './config.js'
@@ -219,13 +219,7 @@ function buildStatements(db) {
     // each get exactly the keys their own SQL mentions.
     list: db.prepare(`SELECT ${LIST_COLUMNS} FROM media${LIST_WHERE}${LIST_ORDER}`),
     listCount: db.prepare(`SELECT count(*) AS n FROM media${LIST_WHERE}`),
-    journal: db.prepare(
-      `INSERT INTO changes (at, module, asset_id, name, action, summary)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ),
-    journalTrim: db.prepare(
-      `DELETE FROM changes WHERE id <= (SELECT max(id) FROM changes) - ${CHANGE_CAP}`,
-    ),
+    ...journalStatements(db),
     insert: db.prepare(
       `INSERT INTO media (id, title, media_type, year, status, rating,
          progress_current, progress_total, progress_unit, notes,

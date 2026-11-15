@@ -11,7 +11,7 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { randomUUID } from 'node:crypto'
-import { inTransaction, statementCache, nowIso, likePattern, CHANGE_CAP } from './db.js'
+import { inTransaction, statementCache, nowIso, likePattern, journalStatements } from './db.js'
 import { ok, fail, attemptSqlite, isFail } from './errors.js'
 import { resolveConfig, ensureReady } from './config.js'
 import {
@@ -385,13 +385,7 @@ function buildStatements(db) {
          platform = ?, status = ?, notes = ?, revision = revision + 1, updated_at = ?
        WHERE id = ? AND revision = ?`,
     ),
-    journal: db.prepare(
-      `INSERT INTO changes (at, module, asset_id, name, action, summary)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ),
-    journalTrim: db.prepare(
-      `DELETE FROM changes WHERE id <= (SELECT max(id) FROM changes) - ${CHANGE_CAP}`,
-    ),
+    ...journalStatements(db),
     list: db.prepare(
       `SELECT ${LIST_COLUMNS} FROM software${LIST_WHERE}
        ORDER BY name ASC LIMIT :limit OFFSET :offset`,
