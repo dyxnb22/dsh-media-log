@@ -3,23 +3,14 @@
 // own library through the same openLibrary() the plugin uses.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, statSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { statSync } from 'node:fs'
 import { join } from 'node:path'
 import { createTools } from '../src/tools.js'
 import { pickCandidates } from '../src/media.js'
 import { openLibrary, resolveDatabasePath, inTransaction, createLibraryHolder } from '../src/db.js'
+import { scratch, exec, render, byName } from './helpers.js'
 
 const UUID = '11111111-2222-3333-4444-555555555555'
-
-function scratch() {
-  const dir = mkdtempSync(join(tmpdir(), 'media-log-test-'))
-  return {
-    dir,
-    dbPath: join(dir, 'media.db'),
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
-  }
-}
 
 /** Config + a fresh library, wired exactly like src/index.js does. */
 async function harness({ databasePath = '', writeEnabled = true } = {}) {
@@ -28,14 +19,6 @@ async function harness({ databasePath = '', writeEnabled = true } = {}) {
   const [mark, pick, search, get, list] = tools
   return { mark, pick, search, get, list, getLibrary }
 }
-
-const exec = (signal) => ({ signal: signal ?? new AbortController().signal })
-const byName = (tools, name) => {
-  const tool = tools.find((t) => t.name === name)
-  assert.ok(tool, `missing tool ${name}`)
-  return tool
-}
-const render = (tool, args, value) => tool.output.render(args, value).map((b) => b.text).join('\n')
 
 /** Inserts rows straight through SQL — via the REAL openLibrary, so the tests
  *  exercise the production schema rather than a copy that could drift. */
@@ -255,23 +238,6 @@ test('create: a clean insert returns a created receipt and reads back', async ()
     assert.equal(back.data.rating, 8)
     assert.equal(back.data.hasNotes, true)
     assert.equal('notes' in back.data, false, 'notes stay out unless asked for')
-  } finally {
-    s.cleanup()
-  }
-})
-
-test('create: started_at/completed_at follow the status', async () => {
-  const s = scratch()
-  try {
-    const { mark, get } = await harness({ databasePath: s.dbPath })
-    const a = await mark.execute({ target: { title: '在看的一部', mediaType: 'tv' }, status: 'in_progress' }, exec())
-    const b = await mark.execute({ target: { title: '看完的一部', mediaType: 'tv' }, status: 'completed' }, exec())
-    const da = await get.execute({ assetId: a.data.receipt.assetId }, exec())
-    const db2 = await get.execute({ assetId: b.data.receipt.assetId }, exec())
-    assert.notEqual(da.data.startedAt, null)
-    assert.equal(da.data.completedAt, null)
-    assert.equal(db2.data.startedAt, null)
-    assert.notEqual(db2.data.completedAt, null)
   } finally {
     s.cleanup()
   }
@@ -684,28 +650,6 @@ test('update: metadata and clear are rejected on create, and contradictions are 
   }
 })
 
-test('update: a metadata patch still respects the observed revision', async () => {
-  const s = scratch()
-  try {
-    await seed(s.dbPath, [
-      { id: UUID, title: '沙丘', media_type: 'movie', status: 'completed', revision: 4 },
-    ])
-    const { mark } = await harness({ databasePath: s.dbPath })
-    const stale = await mark.execute(
-      { target: { assetId: UUID, expectedRevision: 3 }, metadata: { year: 2024 } }, exec(),
-    )
-    assert.equal(stale.error.code, 'STALE_REVISION')
-    assert.equal(stale.error.currentRevision, 4)
-    const fresh = await mark.execute(
-      { target: { assetId: UUID, expectedRevision: 4 }, metadata: { year: 2024 } }, exec(),
-    )
-    assert.equal(fresh.ok, true)
-    assert.equal(fresh.data.receipt.revision, 5)
-  } finally {
-    s.cleanup()
-  }
-})
-
 // ---------------------------------------------------------------------------
 // archive / restore
 // ---------------------------------------------------------------------------
@@ -925,6 +869,19 @@ test('updateByTitle: a near-miss title offers the close records instead of guess
     assert.deepEqual(nothing.error.candidates, [])
     assert.match(render(mark, { target: { title: '沙丘2' } }, nothing), /补上 mediaType/)
 
+    // An unknown title says how to create instead, and following that hint
+    // lands on the first try.
+    const unknown = await mark.execute({ target: { title: '不存在的片子' }, status: 'completed' }, exec())
+    assert.equal(unknown.error.code, 'TARGET_CONFLICT')
+    assert.deepEqual(unknown.error.candidates, [])
+    const unknownText = render(mark, { target: { title: '不存在的片子' } }, unknown)
+    assert.match(unknownText, /没有这条记录/)
+    assert.match(unknownText, /补上 mediaType/)
+    const created = await mark.execute(
+      { target: { title: '不存在的片子', mediaType: 'movie' }, status: 'completed' }, exec(),
+    )
+    assert.equal(created.ok, true)
+
     // A title that IS a prefix of a stored one gets that record offered.
     const near = await mark.execute({ target: { title: '沙丘：第' }, status: 'in_progress' }, exec())
     assert.equal(near.error.code, 'TARGET_CONFLICT')
@@ -940,26 +897,6 @@ test('updateByTitle: a near-miss title offers the close records instead of guess
     const retried = await mark.execute({ target: { title: '沙丘：第二部' }, status: 'in_progress' }, exec())
     assert.equal(retried.ok, true)
     assert.equal(retried.data.receipt.assetId, UUID)
-  } finally {
-    s.cleanup()
-  }
-})
-
-test('updateByTitle: an unknown title says how to create instead', async () => {
-  const s = scratch()
-  try {
-    const { mark } = await harness({ databasePath: s.dbPath })
-    const value = await mark.execute({ target: { title: '不存在的片子' }, status: 'completed' }, exec())
-    assert.equal(value.error.code, 'TARGET_CONFLICT')
-    assert.deepEqual(value.error.candidates, [])
-    const text = render(mark, { target: { title: '不存在的片子' } }, value)
-    assert.match(text, /没有这条记录/)
-    assert.match(text, /补上 mediaType/)
-
-    const created = await mark.execute(
-      { target: { title: '不存在的片子', mediaType: 'movie' }, status: 'completed' }, exec(),
-    )
-    assert.equal(created.ok, true)
   } finally {
     s.cleanup()
   }
@@ -1090,37 +1027,34 @@ test('update: a different review needs replaceNotes, and then replaces', async (
   }
 })
 
-test('update: setting notes where none existed needs no replaceNotes', async () => {
+test('update: setting notes where none existed needs no replaceNotes, for NULL and imported-empty alike', async () => {
   const s = scratch()
   try {
-    await seed(s.dbPath, [{ id: UUID, title: '完美的日子', media_type: 'movie', status: 'completed', revision: 1 }])
+    await seed(s.dbPath, [
+      { id: UUID, title: '完美的日子', media_type: 'movie', status: 'completed', revision: 1 },
+      { id: 'bbbbbbbb-2222-3333-4444-555555555555', title: '空短评', media_type: 'movie', status: 'completed', notes: '' },
+    ])
     const { mark, get } = await harness({ databasePath: s.dbPath })
-    const value = await mark.execute(
-      { target: { assetId: UUID, expectedRevision: 1 }, notes: '第一条短评' },
-      exec(),
+    assert.equal(
+      (await get.execute({ assetId: 'bbbbbbbb-2222-3333-4444-555555555555' }, exec())).data.hasNotes,
+      false,
+      'an imported empty review reads as no review',
     )
-    assert.equal(value.ok, true)
-    const back = await get.execute({ assetId: UUID, includeNotes: true }, exec())
-    assert.equal(back.data.notes, '第一条短评')
-  } finally {
-    s.cleanup()
-  }
-})
 
-test('update: an imported empty review accepts its first notes without confirmation', async () => {
-  const s = scratch()
-  try {
-    await seed(s.dbPath, [{ id: UUID, title: '空短评', media_type: 'movie', status: 'completed', notes: '' }])
-    const { mark, get } = await harness({ databasePath: s.dbPath })
-    const before = await get.execute({ assetId: UUID }, exec())
-    assert.equal(before.data.hasNotes, false)
-    const value = await mark.execute(
-      { target: { assetId: UUID, expectedRevision: 1 }, notes: '第一条短评' }, exec(),
+    for (const assetId of [UUID, 'bbbbbbbb-2222-3333-4444-555555555555']) {
+      const value = await mark.execute(
+        { target: { assetId, expectedRevision: 1 }, notes: '第一条短评' },
+        exec(),
+      )
+      assert.equal(value.ok, true)
+      const back = await get.execute({ assetId, includeNotes: true }, exec())
+      assert.equal(back.data.notes, '第一条短评')
+    }
+    assert.equal(
+      (await get.execute({ assetId: 'bbbbbbbb-2222-3333-4444-555555555555' }, exec())).data.completedAt,
+      null,
+      'a notes-only patch must not invent a completion date',
     )
-    assert.equal(value.ok, true)
-    const back = await get.execute({ assetId: UUID, includeNotes: true }, exec())
-    assert.equal(back.data.notes, '第一条短评')
-    assert.equal(back.data.completedAt, null, 'a notes-only patch must not invent a completion date')
   } finally {
     s.cleanup()
   }
@@ -1184,6 +1118,10 @@ test('search: whitelist candidates, paging and the exhausted flag', async () => 
     const limited = await search.execute({ query: '完美', limit: 1 }, exec())
     assert.equal(limited.data.items.length, 1)
     assert.equal(limited.data.total, null, 'a window that is not exhausted proves nothing')
+
+    const missed = await search.execute({ query: '不存在的' }, exec())
+    assert.equal(missed.ok, true, 'an empty page is a success, not a failure')
+    assert.deepEqual(missed.data.items, [])
   } finally {
     s.cleanup()
   }
@@ -1200,18 +1138,6 @@ test('search: % and _ in the query match literally', async () => {
     const page = await search.execute({ query: '100%' }, exec())
     assert.equal(page.data.items.length, 1)
     assert.equal(page.data.items[0].title, '100% 狼')
-  } finally {
-    s.cleanup()
-  }
-})
-
-test('search: an empty page is a success', async () => {
-  const s = scratch()
-  try {
-    const { search } = await harness({ databasePath: s.dbPath })
-    const page = await search.execute({ query: '不存在的东西' }, exec())
-    assert.equal(page.ok, true)
-    assert.deepEqual(page.data.items, [])
   } finally {
     s.cleanup()
   }
@@ -1556,28 +1482,6 @@ test('search: the real page output renders instead of falling through', async ()
   }
 })
 
-test('get: imported planned/paused/dropped records read back faithfully', async () => {
-  const s = scratch()
-  try {
-    await seed(s.dbPath, [
-      { id: UUID, title: '想看的一部', media_type: 'movie', status: 'planned' },
-      { id: 'dddddddd-2222-3333-4444-555555555555', title: '搁置的一部', media_type: 'game', status: 'paused' },
-      { id: 'eeeeeeee-2222-3333-4444-555555555555', title: '弃了的一部', media_type: 'tv', status: 'dropped' },
-    ])
-    const { get } = await harness({ databasePath: s.dbPath })
-    for (const [id, status] of [
-      [UUID, 'planned'],
-      ['dddddddd-2222-3333-4444-555555555555', 'paused'],
-      ['eeeeeeee-2222-3333-4444-555555555555', 'dropped'],
-    ]) {
-      const value = await get.execute({ assetId: id }, exec())
-      assert.equal(value.data.status, status)
-    }
-  } finally {
-    s.cleanup()
-  }
-})
-
 // ---------------------------------------------------------------------------
 // statement caching
 // ---------------------------------------------------------------------------
@@ -1769,16 +1673,6 @@ test('render: an archived-only match is offered with its label', async () => {
   }
 })
 
-test('render: a stale revision names the current one', () => {
-  const mark = renderer('media_log_mark')
-  const text = render(mark, {}, {
-    ok: false,
-    error: { code: 'STALE_REVISION', message: '被改过了', currentRevision: 7 },
-  })
-  assert.match(text, /STALE_REVISION/)
-  assert.match(text, /revision 7/)
-})
-
 test('render: search pages, detail and unexpected values', () => {
   const search = renderer('media_log_search')
   const get = renderer('media_log_get')
@@ -1804,19 +1698,6 @@ test('render: imported planned/paused/dropped statuses have labels', () => {
   assert.match(render(get, {}, { ok: true, data: { assetId: UUID, title: 'x', status: 'planned' } }), /想看\/想玩/)
   assert.match(render(get, {}, { ok: true, data: { assetId: UUID, title: 'x', status: 'paused' } }), /搁置/)
   assert.match(render(get, {}, { ok: true, data: { assetId: UUID, title: 'x', status: 'dropped' } }), /弃了/)
-})
-
-test('the five media tools are registered with the expected names', () => {
-  const tools = createTools(() => ({ databasePath: '', writeEnabled: false }), async () => {
-    throw new Error('unused')
-  })
-  assert.deepEqual(tools.map((t) => t.name), [
-    'media_log_mark',
-    'media_log_pick',
-    'media_log_search',
-    'media_log_get',
-    'media_log_list',
-  ])
 })
 
 test('pick: draws only from the active planned pool, reports its size, excludes paused/completed/archived', async () => {

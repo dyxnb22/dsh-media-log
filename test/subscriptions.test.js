@@ -3,23 +3,13 @@
 // library through the same openLibrary() the plugin uses.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, statSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { statSync } from 'node:fs'
 import { createSubscriptionTools } from '../src/subscription-tools.js'
 import { openLibrary, createLibraryHolder } from '../src/db.js'
+import { scratch, exec, render } from './helpers.js'
 
 const UUID = '11111111-2222-3333-4444-555555555555'
 const UUID2 = 'bbbbbbbb-2222-3333-4444-555555555555'
-
-function scratch() {
-  const dir = mkdtempSync(join(tmpdir(), 'subscription-test-'))
-  return {
-    dir,
-    dbPath: join(dir, 'media.db'),
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
-  }
-}
 
 /** Config + a fresh library, wired exactly like src/index.js does. */
 async function harness({ databasePath = '', writeEnabled = true } = {}) {
@@ -29,8 +19,6 @@ async function harness({ databasePath = '', writeEnabled = true } = {}) {
   return { mark, list, get, getLibrary }
 }
 
-const exec = (signal) => ({ signal: signal ?? new AbortController().signal })
-const render = (tool, args, value) => tool.output.render(args, value).map((b) => b.text).join('\n')
 const names = (page) => page.data.items.map((i) => i.name).sort()
 
 /** Inserts rows straight through SQL — via the REAL openLibrary, so the tests
@@ -604,13 +592,3 @@ test('writes stay off until writeEnabled is on', async () => {
   }
 })
 
-test('the three subscription tools are registered with the expected names', () => {
-  const tools = createSubscriptionTools(() => ({ databasePath: '', writeEnabled: false }), async () => {
-    throw new Error('unused')
-  })
-  assert.deepEqual(tools.map((t) => t.name), [
-    'subscription_mark',
-    'subscription_list',
-    'subscription_get',
-  ])
-})

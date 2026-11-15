@@ -3,27 +3,13 @@
 // tests drive the REAL tools and read the REAL table.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { apply } from '../src/index.js'
 import { exportLibrary } from '../scripts/export-library.mjs'
 import { openLibrary, CHANGE_CAP } from '../src/db.js'
+import { scratch, exec, render } from './helpers.js'
 
 const UUID = '11111111-2222-3333-4444-555555555555'
 const UUID2 = 'bbbbbbbb-2222-3333-4444-555555555555'
-
-function scratch() {
-  const dir = mkdtempSync(join(tmpdir(), 'changes-test-'))
-  return {
-    dir,
-    dbPath: join(dir, 'media.db'),
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
-  }
-}
-
-const exec = (signal) => ({ signal: signal ?? new AbortController().signal })
-const render = (tool, args, value) => tool.output.render(args, value).map((b) => b.text).join('\n')
 
 async function harness({ databasePath = '', writeEnabled = true } = {}) {
   const registered = new Map()
@@ -51,7 +37,7 @@ async function journal(dbPath) {
   }
 }
 
-test('the host exposes 11 tools and exports only the supported tables', async () => {
+test('the host exposes the 12 tools and exports only the supported tables', async () => {
   const s = scratch()
   try {
     const { tools, mark, changes } = await harness({ databasePath: s.dbPath })

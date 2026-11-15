@@ -6,20 +6,9 @@
 // and every window boundary the tab shows.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { openLibrary } from '../src/db.js'
 import { computeOverview, registerOverviewRoute } from '../src/overview.js'
-
-function scratch() {
-  const dir = mkdtempSync(join(tmpdir(), 'overview-test-'))
-  return {
-    dir,
-    dbPath: join(dir, 'media.db'),
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
-  }
-}
+import { scratch } from './helpers.js'
 
 /** UTC-anchored "now" for the renewal windows (they compare UTC midnight). */
 const NOW = new Date('2026-11-14T12:00:00Z')

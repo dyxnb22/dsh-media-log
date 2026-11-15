@@ -3,23 +3,18 @@
 // The real 787-row library is never touched here.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, readFileSync, existsSync, linkSync, symlinkSync } from 'node:fs'
+import { readFileSync, existsSync, linkSync, symlinkSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 import { importAssetmesh } from '../scripts/import-assetmesh.mjs'
 import { createTools } from '../src/tools.js'
 import { createLibraryHolder } from '../src/db.js'
+import { scratch, exec } from './helpers.js'
 
 const UUID = '11111111-2222-3333-4444-555555555555'
 const OTHER = 'aaaaaaaa-2222-3333-4444-555555555555'
-
-function scratch() {
-  const dir = mkdtempSync(join(tmpdir(), 'media-log-import-'))
-  return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
-}
 
 /** A source library shaped like AssetMesh's, with only the tables we read. */
 function makeAssetmeshShaped(path) {
@@ -208,5 +203,3 @@ async function harnessAt(dbPath) {
   const [mark, , search, get] = tools
   return { mark, search, get, getLibrary: holder }
 }
-
-const exec = () => ({ signal: new AbortController().signal })

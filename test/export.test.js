@@ -2,23 +2,14 @@
 // refusal when the file is not a library.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, statSync, symlinkSync, linkSync } from 'node:fs'
+import { writeFileSync, readFileSync, statSync, symlinkSync, linkSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { exportLibrary } from '../scripts/export-library.mjs'
 import { openLibrary } from '../src/db.js'
-
-function scratch() {
-  const dir = mkdtempSync(join(tmpdir(), 'export-test-'))
-  return {
-    dir,
-    dbPath: join(dir, 'media.db'),
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
-  }
-}
+import { scratch } from './helpers.js'
 
 /** Seeds one row per supported table through the REAL openLibrary. */
 async function seedLibrary(dbPath) {

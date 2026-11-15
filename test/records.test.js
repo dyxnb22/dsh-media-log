@@ -2,28 +2,14 @@
 // temp directory: no mocks, no fixtures, no subprocess.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, statSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { statSync } from 'node:fs'
 import { createSoftwareTools } from '../src/software.js'
 import { createSubscriptionTools } from '../src/subscription-tools.js'
 import { openLibrary, createLibraryHolder } from '../src/db.js'
+import { scratch, exec, render, byName } from './helpers.js'
 
 const UUID = '11111111-2222-3333-4444-555555555555'
 const UUID2 = 'bbbbbbbb-2222-3333-4444-555555555555'
-
-function scratch() {
-  const dir = mkdtempSync(join(tmpdir(), 'records-test-'))
-  return {
-    dir,
-    dbPath: join(dir, 'media.db'),
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
-  }
-}
-
-const exec = (signal) => ({ signal: signal ?? new AbortController().signal })
-const render = (tool, args, value) => tool.output.render(args, value).map((b) => b.text).join('\n')
-const byName = (tools, name) => tools.find((t) => t.name === name)
 
 async function harness(dbPath = '', writeEnabled = true) {
   const getLibrary = createLibraryHolder()
@@ -283,7 +269,7 @@ test('software and subscriptions share a library without borrowing statements', 
   }
 })
 
-test('software: the write gate and the tool names', async () => {
+test('software: the write gate', async () => {
   const s = scratch()
   try {
     const closed = await harness(s.dbPath, false)
@@ -292,11 +278,6 @@ test('software: the write gate and the tool names', async () => {
     )
     assert.equal(blocked.error.code, 'WRITE_DISABLED')
     assert.equal((await closed.list.execute({}, exec())).ok, true, 'reads are not gated')
-
-    const software = createSoftwareTools(() => ({ databasePath: '', writeEnabled: false }), async () => {
-      throw new Error('unused')
-    })
-    assert.deepEqual(software.map((t) => t.name), ['software_mark', 'software_list', 'software_get'])
   } finally {
     s.cleanup()
   }
