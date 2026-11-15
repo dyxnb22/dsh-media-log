@@ -168,9 +168,13 @@ test('inTransaction preserves SQLITE_FULL, and the envelope reads it as LIBRARY_
 
     // The same failure through the shared mapper is an environment problem,
     // not a plugin bug: it surfaces as a clean LIBRARY_UNAVAILABLE value.
+    // The same loop as above, because after the rollback one stray insert
+    // can fit in the pages the failed transaction freed.
     const mapped = attemptSqlite(() =>
       inTransaction(db, () => {
-        insert.run('filler-x', '填充', 'movie', 'completed', 'x'.repeat(2000), '2026', '2026')
+        for (let i = 0; i < 20; i += 1) {
+          insert.run(`filler-${i}`, `填充 ${i}`, 'movie', 'completed', 'x'.repeat(2000), '2026', '2026')
+        }
       }),
     )
     assert.equal(mapped.ok, false)
