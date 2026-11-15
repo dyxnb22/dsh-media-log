@@ -1,7 +1,7 @@
 {
   "name": "dsh-media-log",
   "version": "1.1.0",
-  "description": "DeepSeek Harness plugin that logs what you watch and play: mark media, search, and read details from a local SQLite library the plugin owns.",
+  "description": "DeepSeek Harness plugin that logs what you watch and play, your subscriptions, and a why-did-I-install-it software inventory, in one local SQLite library the plugin owns.",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {

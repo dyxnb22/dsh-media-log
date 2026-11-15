@@ -6,7 +6,7 @@
 // 用法：
 //   node scripts/import-assetmesh.mjs --from <assetmesh.db 绝对路径> [--to <新库路径>]
 //
-// Only the fields the three tools expose are carried over. AssetMesh's other
+// Only the fields the media tools expose are carried over. AssetMesh's other
 // tables (activity_events, search_documents FTS, tags, relations, info_records,
 // external_refs, software/service records) are the domain layer this plugin
 // deliberately does not have, so they are not imported.

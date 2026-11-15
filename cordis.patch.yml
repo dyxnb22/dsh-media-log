@@ -1,8 +1,8 @@
 # dsh-media-log bundle layer — applied when a profile lists this bundle
 # (package.json declares `dsh.bundle.patch` pointing at this file).
 # `name` is a PACKAGE NAME resolved through the profile's node_modules —
-# the Host loads the package main export, which registers the three
-# media_log_* tools.
+# the Host loads the package main export, which registers the plugin's
+# tools.
 - insert:
     - id: media-log
       name: dsh-media-log

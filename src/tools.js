@@ -351,7 +351,7 @@ function renderValue(args, value) {
 }
 
 /**
- * Creates the three tools. `getConfig` re-resolves the activation config per
+ * Creates the five media tools. `getConfig` re-resolves the activation config per
  * call so settings writes take effect live (paste-dock pattern).
  * @param {() => Record<string, unknown>} getConfig
  * @param {(databasePath?: string) => Promise<import('node:sqlite').DatabaseSync>} getLibrary
